@@ -42,19 +42,19 @@ cam_pipeline_config_t board_pipeline_default_config(void *display_parent,
     s_lvgl_display_config.byte_swap = true;
 #endif
 
-    /* TODO: landscape camera rotation compensation — see docs/lvgl-display-rotation.md */
-
-    /* DSI landscape: LVGL stays portrait — use physical portrait dimensions. */
+    /* DSI landscape: the flush callback rotates the entire LVGL canvas
+     * 90° CCW to the portrait panel.  Pre-rotate the camera frame 90° CW
+     * so the net camera orientation matches portrait mode. */
 #if BOARD_LANDSCAPE && BOARD_DISPLAY_DRIVER == DISPLAY_ST7701
-    cam_pipeline_config_t config = {
-        .display_width  = BOARD_LCD_H_RES,
-        .display_height = BOARD_LCD_V_RES,
+    int cam_rotation = (BOARD_CAMERA_ROTATION + 270) % 360;
 #else
+    int cam_rotation = BOARD_CAMERA_ROTATION;
+#endif
+
     cam_pipeline_config_t config = {
         .display_width  = BOARD_DISP_H_RES,
         .display_height = BOARD_DISP_V_RES,
-#endif
-        .rotation       = BOARD_CAMERA_ROTATION,
+        .rotation       = cam_rotation,
         .display_driver = &board_pipeline_lvgl_display_driver,
         .display_config = &s_lvgl_display_config,
         .display_parent = display_parent,

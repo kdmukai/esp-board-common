@@ -41,7 +41,7 @@ static const char *TAG = "qr_decoder";
 /* ── FPS stats display ── */
 
 #ifdef CONFIG_CAM_PIPELINE_DEBUG
-#if BOARD_DISPLAY_DRIVER == DISPLAY_ST7701 && !BOARD_LANDSCAPE
+#if BOARD_DISPLAY_DRIVER == DISPLAY_ST7701
 static lv_obj_t *fps_label = NULL;
 #endif
 static cam_pipeline_handle_t s_pipeline = NULL;
@@ -59,33 +59,6 @@ static int64_t s_detect_time_prev = 0;
 
 #endif /* CONFIG_CAM_PIPELINE_DEBUG */
 
-/* ── DSI landscape: pre-rendered rotated overlays ── */
-#if BOARD_LANDSCAPE && BOARD_DISPLAY_DRIVER == DISPLAY_ST7701
-#include "overlay_rotated.h"
-
-/* ── Canvas dimensions ──
- * Canvas is a horizontal text buffer; after 90° CCW rotation:
- *   canvas_w → rotated image height (portrait Y span = landscape X extent)
- *   canvas_h → rotated image width  (portrait X span = landscape Y extent) */
-
-/* Camera square is centered: gap = (BOARD_LCD_V_RES - square) / 2 per side.
- * For 480x800 display with 480x480 camera → 160px gap on each side. */
-#define LANDSCAPE_GAP  ((BOARD_LCD_V_RES - BOARD_LCD_H_RES) / 2)
-
-/* FPS: 4 short lines in the landscape-right gap (portrait top gap).
- * RGB565 opaque — no alpha blend cost on the black gap area. */
-#define FPS_CANVAS_W   130   /* landscape X extent (fits within 160px gap) */
-#define FPS_CANVAS_H   130   /* landscape Y extent (4 lines at ~28px each) */
-
-/* QR result: full landscape width, transparent over camera feed. */
-#define QR_CANVAS_W    BOARD_LCD_V_RES   /* 800 — full landscape width */
-#define QR_CANVAS_H    80
-
-#ifdef CONFIG_CAM_PIPELINE_DEBUG
-static rotated_overlay_t fps_overlay;
-#endif
-static rotated_overlay_t qr_overlay;
-#endif /* BOARD_LANDSCAPE && DISPLAY_ST7701 */
 
 #ifdef CONFIG_CAM_PIPELINE_DEBUG
 
@@ -124,15 +97,7 @@ static void update_fps_stats(void)
     }
 
     char buf[80];
-#if BOARD_LANDSCAPE && BOARD_DISPLAY_DRIVER == DISPLAY_ST7701
-    /* One stat per line — fits the narrow landscape gap strip */
-    snprintf(buf, sizeof(buf), "cam: %.0f\ndisp: %.0f\nscan: %.0f\ndet: %.0f",
-             ema_cam, ema_disp, ema_scan, ema_det);
-    if (fps_overlay.img_rotated) {
-        rotated_overlay_update(&fps_overlay, buf, lv_color_white(),
-                               &lv_font_montserrat_24);
-    }
-#elif BOARD_DISPLAY_DRIVER != DISPLAY_ST7701
+#if BOARD_DISPLAY_DRIVER != DISPLAY_ST7701
 #if BOARD_LANDSCAPE
     /* One stat per line — fits the narrow 80px landscape gap strip */
     snprintf(buf, sizeof(buf), "cam: %.0f\ndisp: %.0f\nscan: %.0f\ndet: %.0f",
@@ -143,6 +108,7 @@ static void update_fps_stats(void)
 #endif
     overlay_text_set_fps(s_overlay, buf);
 #else
+    /* DSI: LVGL labels — landscape or portrait */
     snprintf(buf, sizeof(buf), "cam: %.0f  disp: %.0f\nscan: %.0f  det: %.0f",
              ema_cam, ema_disp, ema_scan, ema_det);
     if (fps_label) {
@@ -171,7 +137,7 @@ static void fps_timer_cb(lv_timer_t *timer)
 
 /* ── QR result display ── */
 
-#if BOARD_DISPLAY_DRIVER == DISPLAY_ST7701 && !BOARD_LANDSCAPE
+#if BOARD_DISPLAY_DRIVER == DISPLAY_ST7701
 static lv_obj_t *qr_label = NULL;
 #endif
 
@@ -188,13 +154,9 @@ static lv_timer_t *fade_timer = NULL;
 static void fade_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
-#if BOARD_LANDSCAPE
-    rotated_overlay_show(&qr_overlay, false);
-#else
     if (qr_label) {
         lv_obj_add_flag(qr_label, LV_OBJ_FLAG_HIDDEN);
     }
-#endif
     lv_timer_delete(fade_timer);
     fade_timer = NULL;
 }
@@ -237,18 +199,10 @@ static void on_qr_decoded(const uint8_t *payload, size_t len,
     overlay_text_set_qr(s_overlay, text, QR_DISPLAY_TIMEOUT_MS);
 #else
     if (lvgl_port_lock(50)) {
-#if BOARD_LANDSCAPE
-        if (qr_overlay.img_rotated) {
-            rotated_overlay_update(&qr_overlay, text, lv_color_hex(0x00FF00),
-                                   &lv_font_montserrat_24);
-            rotated_overlay_show(&qr_overlay, true);
-        }
-#else
         if (qr_label) {
             lv_label_set_text(qr_label, text);
             lv_obj_clear_flag(qr_label, LV_OBJ_FLAG_HIDDEN);
         }
-#endif
 
         /* Reset or create the auto-hide timer */
         if (fade_timer) {
@@ -283,19 +237,11 @@ void app_main(void)
     ESP_LOGI(TAG, "QR decoder starting");
 
     /* Initialize board hardware.
-     * Landscape: LVGL and panel stay in portrait orientation.
-     * DSI: rotated canvas overlays handle visual rotation.
-     * SPI dummy-draw: panel stays portrait — camera rotates with the board,
-     *   so MADCTL swap_xy would just rotate the image an extra 90°.
-     *   Text overlays rendered rotated manually. */
+     * DSI landscape: board_init handles rotation via custom flush callback.
+     * SPI landscape: panel stays portrait, text overlays rendered rotated. */
     lv_display_t *disp;
     lv_indev_t *touch;
-#if BOARD_LANDSCAPE
-    ESP_LOGI(TAG, "Landscape mode: panel stays portrait, overlays handle rotation");
-    board_app_config_t app_cfg = { .landscape = false };
-#else
     board_app_config_t app_cfg = { .landscape = BOARD_LANDSCAPE };
-#endif
     board_init(&app_cfg, &disp, &touch);
 
     /* Build pipeline config from board defines */
@@ -359,51 +305,16 @@ void app_main(void)
     if (lvgl_port_lock(0)) {
         lv_obj_set_style_bg_color(screen, lv_color_hex(0x000000), 0);
 
-#if BOARD_LANDSCAPE && BOARD_DISPLAY_DRIVER == DISPLAY_ST7701
-        /* ── DSI landscape: pre-rendered rotated overlays ──
-         * Canvas text rendering + CPU 90° CCW rotation + bbox crop.
-         * Avoids transform_rotation + direct_mode incompatibility.
-         * RGB565 for opaque gap overlays, ARGB8888 for transparent camera overlays.
-         *
-         * Portrait coords → landscape viewing:
-         *   portrait top   (y=0)   → landscape right
-         *   portrait bottom(y=800) → landscape left  */
-
-        /* QR result overlay — landscape bottom (portrait right edge), transparent */
-        if (rotated_overlay_init(&qr_overlay, screen,
-                                 QR_CANVAS_W, QR_CANVAS_H,
-                                 LV_COLOR_FORMAT_ARGB8888,
-                                 BOARD_LCD_H_RES - QR_CANVAS_H - 4,  /* near right = landscape bottom */
-                                 0)) {                                /* top of portrait y = landscape right edge */
-            rotated_overlay_show(&qr_overlay, false);
-            ESP_LOGI(TAG, "QR overlay: %dx%d ARGB8888 (landscape bottom)",
-                     QR_CANVAS_W, QR_CANVAS_H);
-        }
-
-#ifdef CONFIG_CAM_PIPELINE_DEBUG
-        /* FPS stats overlay — landscape-right gap (portrait top gap).
-         * RGB565 opaque: no alpha blend cost on the black gap area.
-         * base_y positions the full canvas so text starts near the camera
-         * boundary (left edge of the gap in landscape) and extends toward
-         * the screen edge (rightward in landscape = toward portrait y=0). */
-        if (rotated_overlay_init(&fps_overlay, screen,
-                                 FPS_CANVAS_W, FPS_CANVAS_H,
-                                 LV_COLOR_FORMAT_RGB565,
-                                 8,                                   /* portrait left pad = landscape top pad */
-                                 LANDSCAPE_GAP - FPS_CANVAS_W)) {    /* align canvas bottom near camera boundary */
-            ESP_LOGI(TAG, "FPS overlay: %dx%d RGB565 (landscape-right gap)",
-                     FPS_CANVAS_W, FPS_CANVAS_H);
-        }
-#endif
-
-#elif BOARD_DISPLAY_DRIVER != DISPLAY_ST7701
-        /* ── SPI portrait dummy-draw: text in panel gap areas via overlay_text ──
+#if BOARD_DISPLAY_DRIVER != DISPLAY_ST7701
+        /* ── SPI dummy-draw: text in panel gap areas via overlay_text ──
          * LVGL is stopped (dummy-draw mode) so no widgets or timers work.
          * See docs/knowledge/text-overlay-architecture.md for why each path
          * uses a different approach. */
 
 #else
-        /* ── DSI portrait: standard LVGL label widgets ── */
+        /* ── DSI: standard LVGL label widgets (portrait and landscape) ──
+         * Landscape rotation is handled by the flush callback in board_init,
+         * so LVGL widgets render in logical coordinates for both orientations. */
 
         qr_label = lv_label_create(screen);
         lv_obj_set_width(qr_label, BOARD_DISP_H_RES - 20);
