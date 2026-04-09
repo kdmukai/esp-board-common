@@ -56,6 +56,7 @@
 #include "esp_lcd_touch.h"
 #if BOARD_DISPLAY_DRIVER == DISPLAY_ST7701
 #include "esp_lcd_mipi_dsi.h"
+#include "esp_timer.h"
 #endif
 #include "lvgl.h"
 
@@ -244,11 +245,32 @@ static void st7701_landscape_flush_cb(lv_display_t *disp,
     /* 90° CCW rotation: portrait(px, py) = landscape(DISP_W-1-py, px)
      * No byte swap needed for MIPI-DSI (unlike SPI panels).
      * We rotate into the back buffer while the panel scans the front. */
+    int64_t t0 = esp_timer_get_time();
+
     for (int px = 0; px < BOARD_LCD_H_RES; px++) {
         for (int py = 0; py < BOARD_LCD_V_RES; py++) {
             int fb_x = DISP_W - 1 - py;
             out[py * BOARD_LCD_H_RES + px] = fb[px * DISP_W + fb_x];
         }
+    }
+
+    int64_t t1 = esp_timer_get_time();
+    static int64_t disp_rot_sum = 0;
+    static int64_t disp_rot_max = 0;
+    static int disp_rot_count = 0;
+    static int64_t disp_rot_last_log = 0;
+    int64_t disp_rot_dur = t1 - t0;
+    disp_rot_sum += disp_rot_dur;
+    if (disp_rot_dur > disp_rot_max) disp_rot_max = disp_rot_dur;
+    disp_rot_count++;
+    if (t1 - disp_rot_last_log > 2000000) {  /* every 2s */
+        ESP_LOGI(TAG, "DISP CPU: avg=%lld us  max=%lld us  n=%d",
+                 (long long)(disp_rot_sum / disp_rot_count),
+                 (long long)disp_rot_max, disp_rot_count);
+        disp_rot_sum = 0;
+        disp_rot_max = 0;
+        disp_rot_count = 0;
+        disp_rot_last_log = t1;
     }
 
     /* Wait for vsync, then submit draw_bitmap so the DMA copy runs
@@ -334,6 +356,7 @@ static void lvgl_port_setup(const board_app_config_t *app_cfg,
         st7701_rot_buf[0] = heap_caps_malloc(rot_buf_sz, MALLOC_CAP_SPIRAM);
         st7701_rot_buf[1] = heap_caps_malloc(rot_buf_sz, MALLOC_CAP_SPIRAM);
         assert(buf1 && buf2 && st7701_rot_buf[0] && st7701_rot_buf[1]);
+
         dpi_flush_sem = xSemaphoreCreateBinary();
 
         lvgl_port_lock(0);

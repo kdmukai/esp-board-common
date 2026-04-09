@@ -1,5 +1,21 @@
 # PPA Full-Frame Rotation Upgrade Plan
 
+## Outcome (2026-04-09)
+
+**Implemented and tested — not viable.** PPA rotation works correctly but
+the single PPA SRM engine is shared with the camera pipeline's
+crop+scale+rotate. Both use `PPA_TRANS_MODE_BLOCKING`, serializing on the
+hardware. Display rotation averaged 84ms (vs 23ms for CPU rotation) because
+it waited behind the camera's ~55ms PPA operations. Display FPS dropped
+from 7-8fps to 2fps. Reverted to CPU rotation.
+
+The PPA hardware itself is fast (first frame completed in 15ms before the
+camera started). The problem is purely contention. PPA display rotation
+would be viable for apps without camera PPA usage (e.g., static LVGL
+screens).
+
+Full experiment results in `docs/knowledge/p4-lcd43-landscape-pipeline-optimization.md`.
+
 ## Background
 
 The DSI landscape flush callback in `board_init.c` currently uses a CPU

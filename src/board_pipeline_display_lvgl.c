@@ -21,6 +21,7 @@
 #include "freertos/task.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_lvgl_port.h"
 #include "esp_lcd_panel_ops.h"
 #include "board.h"
@@ -122,6 +123,31 @@ static bool push_frame_image_widget(lvgl_display_ctx_t *ctx,
     lv_obj_invalidate(ctx->container);
 
     lvgl_port_unlock();
+
+    /* Measure interval between consecutive successful pushes */
+    static int64_t last_push = 0;
+    static int64_t interval_sum = 0;
+    static int64_t interval_max = 0;
+    static int interval_count = 0;
+    static int64_t interval_last_log = 0;
+    int64_t now = esp_timer_get_time();
+    if (last_push > 0) {
+        int64_t interval = now - last_push;
+        interval_sum += interval;
+        if (interval > interval_max) interval_max = interval;
+        interval_count++;
+        if (now - interval_last_log > 2000000) {
+            ESP_LOGI(TAG, "DISP INTERVAL: avg=%lld us  max=%lld us  n=%d",
+                     (long long)(interval_sum / interval_count),
+                     (long long)interval_max, interval_count);
+            interval_sum = 0;
+            interval_max = 0;
+            interval_count = 0;
+            interval_last_log = now;
+        }
+    }
+    last_push = now;
+
     return true;
 }
 

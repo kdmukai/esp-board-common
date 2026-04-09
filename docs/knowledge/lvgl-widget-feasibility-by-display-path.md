@@ -7,7 +7,7 @@ Interactive LVGL widgets (sliders, progress bars, gauges) are needed for transie
 | Path | Native LVGL widgets? | Approach |
 |------|---------------------|----------|
 | DSI portrait (P4 LCD 4.3) | **Yes** | Widgets work natively, no tricks needed |
-| DSI landscape (P4 LCD 4.3) | **Yes, with caveat** | Place widgets in portrait coordinates; they appear rotated to match landscape view |
+| DSI landscape (P4 LCD 4.3) | **Yes** | LVGL runs in landscape coordinates; flush callback rotates to portrait panel |
 | SPI portrait (P4 LCD 3.5) | **Possible** | Resume LVGL temporarily, accept tearing/frame drops |
 | SPI landscape (P4 LCD 3.5) | **Possible** | Same as SPI portrait — MADCTL handles rotation |
 
@@ -41,32 +41,35 @@ From `board_init.c`, the ST7796 SPI board uses:
 
 ## DSI Landscape (P4 LCD 4.3)
 
-### The constraint
+### How it works (commit e6e58ce)
 
-The DSI display is registered with LVGL in portrait dimensions using `direct_mode`:
-```c
-.hres = BOARD_LCD_H_RES,   // 480 (portrait width)
-.vres = BOARD_LCD_V_RES,   // 800 (portrait height)
-.flags = { .direct_mode = 1 },
-```
+LVGL runs in landscape coordinates (800×480). A custom flush callback
+CPU-rotates the entire frame 90° CCW into a PSRAM buffer, then submits
+to the portrait panel synced to vsync. All LVGL widgets — labels,
+sliders, images — render normally in landscape coordinates. No manual
+rotation or portrait-coordinate tricks needed.
 
-LVGL thinks the screen is portrait. `transform_rotation` on widgets is incompatible with `direct_mode` DSI rendering. This is why text overlays use the pre-rendered canvas + CPU rotation approach.
+The LVGL display is created directly via `lv_display_create()` +
+`lv_display_set_buffers()`, bypassing `esp_lvgl_port`'s DSI path.
 
-### Why native widgets still work
+### Why esp_lvgl_port is bypassed for landscape
 
-LVGL is already running (not stopped like SPI dummy-draw). Both rendering AND touch input are in portrait coordinates, so they stay consistent with each other.
+`lvgl_port_add_disp_dsi()` only supports `direct_mode` +
+`avoid_tearing=true`, which uses the DPI panel's portrait framebuffers.
+The library's internal flush for DSI + direct_mode unconditionally calls
+`xSemaphoreTake(trans_sem)` (line 717), but `trans_sem` is only created
+with `avoid_tearing=true` (line 345). Any other combination crashes.
+See `esp_lvgl_port` source `src/lvgl9/esp_lvgl_port_disp.c`.
 
-A vertical `lv_slider` placed along the portrait y-axis will:
-- **Appear** as a horizontal slider to the landscape viewer
-- **Respond to touch** correctly — the user's horizontal drag in landscape maps to a vertical drag in portrait space, which is the natural axis for a vertical slider
+Portrait mode still uses `lvgl_port_add_disp_dsi()` with
+`avoid_tearing=true` unchanged.
 
-The camera feed is already pre-rotated (PPA) before going into the image widget, so it looks correct in landscape. Widgets placed in portrait coordinates naturally appear in the correct landscape orientation.
+### Camera rotation compensation
 
-**Mental model:** Design widget placement in portrait coordinates, knowing everything appears rotated 90° to the landscape viewer. No canvas rotation, no manual touch coordinate remapping needed.
-
-### Why this is different from text overlays
-
-Text overlays use the canvas + rotation approach because they need pixel-perfect horizontal text rendering. A slider or progress bar doesn't have the same orientation sensitivity — a vertical slider in portrait IS a horizontal slider in landscape. The symmetry works in your favor.
+The flush rotates the entire LVGL canvas 90° CCW, including the camera
+image widget. The camera PPA is pre-rotated 90° CW to compensate:
+`(BOARD_CAMERA_ROTATION + 270) % 360`. Net result: camera orientation
+matches portrait mode.
 
 ## DSI Portrait (P4 LCD 4.3)
 
