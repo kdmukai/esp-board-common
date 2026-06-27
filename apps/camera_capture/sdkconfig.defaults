@@ -1,0 +1,34 @@
+# camera_capture — shared settings for all boards
+
+# Partition table — 2MB app slot (default 1MB is too tight) + coredump
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+
+# Core dump to flash — captures crash backtraces
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
+CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y
+CONFIG_ESP_COREDUMP_CAPTURE_DRAM=y
+
+# Task watchdog
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+
+# CSI camera (ESP32-P4 boards with OV5647)
+CONFIG_CAMERA_OV5647=y
+CONFIG_CAMERA_OV5647_MIPI_RAW10_1280x960_BINNING_45FPS=y
+CONFIG_ESP_VIDEO_ENABLE_ISP_PIPELINE_CONTROLLER=y
+# Allow CSI driver to allocate its internal backup buffer for DMA safety
+# CONFIG_ESP_VIDEO_DISABLE_MIPI_CSI_DRIVER_BACKUP_BUFFER is not set
+
+# Disable task WDT — camera DQBUF blocks the idle task
+CONFIG_ESP_TASK_WDT_EN=n
+# FreeRTOS timer task needs more stack for camera/ISP
+CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=4096
+
+# Debug metrics
+CONFIG_CAM_PIPELINE_DEBUG=y
+
+# LVGL fonts (for review-mode save/discard button labels)
+CONFIG_LV_FONT_MONTSERRAT_14=y
+CONFIG_LV_FONT_MONTSERRAT_24=y
