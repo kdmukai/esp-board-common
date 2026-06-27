@@ -7,5 +7,5 @@ endif()
 idf_component_register(
     SRCS "main.c"
     INCLUDE_DIRS "."
-    REQUIRES "esp-board-common" "espressif__esp_lvgl_port" "esp-camera-pipeline" "cam_pipeline_qr" "esp_lcd" ${EXTRA_REQS}
+    REQUIRES "esp-board-common" "board_log_flash" "espressif__esp_lvgl_port" "esp-camera-pipeline" "cam_pipeline_qr" "esp_lcd" ${EXTRA_REQS}
 )

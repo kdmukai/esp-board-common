@@ -9,6 +9,7 @@ message(STATUS "Building for board: ${BOARD}")
 # esp-camera-pipeline and its sub-components (cam_pipeline_qr, k_quirc)
 set(EXTRA_COMPONENT_DIRS
     "${CMAKE_CURRENT_SOURCE_DIR}/../.."
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../components"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../components/esp-camera-pipeline"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../components/esp-camera-pipeline/components"
 )

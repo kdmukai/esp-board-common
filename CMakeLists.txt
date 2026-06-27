@@ -19,7 +19,6 @@ set(SRC_FILES
     "src/board_pipeline.c"
     "src/board_sdcard.c"
     "src/board_audio.c"
-    "src/board_log_flash.c"
     "src/overlay_text.c"
     "src/overlay_rotated.c"
 )

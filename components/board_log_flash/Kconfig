@@ -1,0 +1,12 @@
+menu "Flash Log"
+
+    config BOARD_LOG_TO_FLASH
+        bool "Boot log to flash"
+        default n
+        help
+            Capture all ESP_LOGx output to a flash partition ("log_store").
+            The previous boot's log is dumped to serial on startup.
+            Requires a "log_store" data partition (subtype 0x42, 64KB+)
+            in the partition table.
+
+endmenu
