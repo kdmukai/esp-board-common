@@ -8,6 +8,17 @@ built-in rotation flags are incompatible with the DSI rendering path.
 
 This document captures the full architecture so we stop re-deriving it.
 
+> **Status (reconciled 2026-06):** the landscape flush callback described
+> below is now **implemented** (commit `e6e58ce`), using **CPU rotation** —
+> *not* PPA. The PPA full-frame flush rotation this doc originally recommended
+> was later measured at **2 fps** (the single PPA SRM engine serializes with
+> the camera's PPA scale pass) and **reverted — it is contraindicated.** The
+> camera pipeline's separate pre-rotated-overlay path (the "How the Camera
+> Pipeline Differs" section) was also **eliminated** by `e6e58ce`, which
+> collapsed overlays to plain LVGL labels. Those sections are kept for
+> historical context and flagged inline. See
+> `p4-lcd43-landscape-pipeline-optimization.md` for the measured numbers.
+
 ## The Panel
 
 ST7701 is a MIPI-DSI DPI (video-mode) panel. It has no internal framebuffer
@@ -33,7 +44,12 @@ and calls the flush callback to push pixels to the panel.
 The camera pipeline (`esp-camera-pipeline`) captures frames, PPA-rotates them
 for the physical panel orientation, and pushes them to the panel via an LVGL
 image widget on a dedicated camera screen. Overlays (FPS stats, QR decode
-text) are pre-rotated and composited as LVGL image widgets on the same screen.
+text) are plain LVGL label widgets on the same screen.
+
+> *Originally these overlays were individually pre-rotated image widgets.
+> `e6e58ce` made the whole LVGL canvas render in landscape via the flush
+> callback, so overlays became ordinary landscape labels — the pre-rotation
+> path described later in this doc is no longer used.*
 
 The camera pipeline operates on its own LVGL screen. `pipeline_create()`
 loads the camera screen; `pipeline_destroy()` tears it down and returns
@@ -142,17 +158,22 @@ lv_display_flush_ready()
 
 ### Rotation options
 
-**CPU loop** (original implementation, commit 490f027):
+**CPU loop** — the current, correct choice (commit 490f027, restored in `e6e58ce`):
 - Pixel-by-pixel nested loop: `out[py * 480 + px] = fb[px * 800 + (799 - py)]`
-- 384,000 pixels at 2 bytes each = 768KB rotated per frame
-- Works but slow for large displays
+- 384,000 pixels at 2 bytes each = 768KB rotated per frame (~22 ms)
+- This is what ships. It coexists cleanly with the camera's PPA scale pass
+  because it uses the CPU, not the contended PPA engine.
 
-**PPA hardware DMA** (preferred for P4):
+**PPA hardware DMA** — ⚠️ **tried and contraindicated, do not use for the flush:**
 - `ppa_do_scale_rotate_mirror()` with `PPA_SRM_ROTATION_ANGLE_90`
-- Hardware DMA rotation, near-instant for partial bands
-- Requires 128-byte aligned output buffer and buffer_size
-- esp_lvgl_port's `LVGL_PORT_ENABLE_PPA` Kconfig creates a PPA client
-- Can rotate partial bands (e.g. 800×50) — no minimum size constraint for RGB565
+- Looks attractive (hardware DMA, near-instant in isolation), **but** the P4
+  has a **single PPA SRM engine** shared with the camera pipeline's per-frame
+  scale pass. Rotating the flush on PPA serializes the two passes and was
+  **measured at 2 fps** during live preview — far worse than CPU rotation's
+  ~10 fps. It was reverted. See `p4-lcd43-landscape-pipeline-optimization.md`.
+- PPA flush rotation could only make sense when no camera pipeline is running
+  (LVGL-screens-only), and even then the CPU loop is fast enough — so there is
+  no live use case for it.
 
 ### Buffer allocation
 
@@ -172,7 +193,12 @@ Mitigation: wait for the `on_refresh_done` vsync callback before calling
 Drain any stale vsync first (the panel may have fired one while LVGL was
 rendering).
 
-## How the Camera Pipeline Differs
+## How the Camera Pipeline Differs (superseded by `e6e58ce`)
+
+> **This entire section describes the pre-`e6e58ce` design and no longer
+> matches the code.** With the landscape flush callback active, LVGL renders
+> in landscape during camera mode too, so overlays are plain landscape labels
+> and `overlay_rotated.c` is no longer used for DSI. Retained as history.
 
 The camera pipeline doesn't use LVGL's rendering pipeline for the camera feed:
 
@@ -199,7 +225,7 @@ rotation (768KB+) where DMA bandwidth dominates.
 |--------|----------------------------|--------------------------|
 | What's rotated | Entire LVGL framebuffer (800×480) | Small text regions (~130×60) |
 | When | Every flush (continuous) | On text change (sporadic) |
-| Rotation method | PPA hardware DMA (preferred) | CPU loop (adequate for small buffers) |
+| Rotation method | CPU loop (~22 ms; PPA contraindicated) | CPU loop (adequate for small buffers) |
 | Buffer source | LVGL draw buffer | Hidden LVGL canvas |
 | Output destination | `draw_bitmap` → panel | `lv_image` widget → LVGL composites |
 | Active during | LVGL screen mode | Camera pipeline mode |
@@ -215,8 +241,14 @@ camera screen and its overlays before LVGL screens take over, and vice versa.
   dropped ("not yet implemented"), portrait `direct_mode + avoid_tearing`
   used instead. Research doc `docs/lvgl-display-rotation.md` committed in
   this revision but later deleted from tree (still accessible via git show).
-- **Current**: Portrait rendering only. Landscape flush needs to be
-  re-implemented following the architecture above.
+- **e6e58ce**: Landscape flush callback restored (CPU rotation, vsync-synced
+  double-buffered PSRAM output) following the architecture above. Collapsed the
+  three overlay paths into two by eliminating the pre-rotated `rotated_overlay_t`
+  canvas pipeline for DSI landscape — overlays are now plain landscape labels.
+- **a4da411**: Pipeline performance instrumentation; confirmed PPA full-frame
+  flush rotation = 2 fps (reverted), CPU rotation = ~10 fps preview. See
+  `p4-lcd43-landscape-pipeline-optimization.md`.
+- **Current**: DSI landscape rendering works via the CPU-rotation flush callback.
 
 ## Key Invariants
 
@@ -224,7 +256,10 @@ camera screen and its overlays before LVGL screens take over, and vice versa.
    esp_lvgl_port v2.7.2. Do not attempt to combine them.
 2. Landscape flush requires `avoid_tearing = false` and a custom flush
    callback that rotates to portrait before `draw_bitmap`.
-3. The camera pipeline manages its own rotation (PPA for frames, CPU for
-   overlays) independent of the LVGL display rotation path.
+3. The flush callback rotates on the **CPU**, never the PPA: the P4's single
+   PPA SRM engine is already used by the camera scale pass, and sharing it for
+   flush rotation drops preview to 2 fps. The camera pipeline PPA-rotates the
+   *frame* (its own scale pass); overlays are plain landscape labels since
+   `e6e58ce` (no separate overlay rotation).
 4. Never delete the LVGL active screen without loading a replacement first
    (see `lvgl-null-active-screen-crash.md`).
