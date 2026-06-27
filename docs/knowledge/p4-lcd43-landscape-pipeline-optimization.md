@@ -245,10 +245,30 @@ The display and QR decoder consume frames through different mechanisms:
    it for the duration of decode (~80ms). This is the only consumer that
    occupies a triple-buffer slot.
 
-The `front_consumed` flag is set by either consumer — display (`push_frame`
-success) or QR (`lock_frame`) — signaling that the camera should process
-the next frame. Both consumers can use data from the same processed frame
-(display via memcpy, QR via lock), but they don't compete for buffer slots.
+The `front_consumed` flag is effectively only driven by the QR consumer's
+`lock_frame`. The display's `push_frame` sets `front_consumed = true`, but
+this is immediately overwritten by `front_consumed = false` when the back
+buffer is promoted to front in the same `frame_cb` call. This is not a bug
+— the display was already served (via memcpy) during that call, and the
+new front buffer genuinely hasn't been consumed yet. The skip mechanism is
+QR-consumer-driven, which is correct: the display is always served inline
+during processing, while QR is the asynchronous consumer that determines
+whether the pipeline should process the next frame.
+
+## Future: Triple Buffer vs Double Buffer
+
+The triple buffer may be unnecessary given the current architecture:
+
+- Display never holds a buffer slot (uses memcpy)
+- QR is the only consumer that locks a buffer (~80ms hold time)
+- Frame skip means the camera is already idle most of the time
+
+With double buffering, the camera would block when QR holds one buffer and
+the other is front. But with skip-at-most-1 already discarding ~50% of
+frames, the additional skips from buffer contention would be a small
+increment. The tradeoff is 460KB PSRAM saved (one fewer 480x480 RGB565
+buffer) vs slightly more frame skips during QR processing. Worth testing
+separately.
 
 ## Summary of Interactions
 
