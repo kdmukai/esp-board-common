@@ -90,6 +90,7 @@ cam_pipeline_config_t board_pipeline_default_config(void *display_parent,
 #elif BOARD_CAMERA_INTERFACE == CAMERA_CSI
     s_csi_config = (board_pipeline_csi_config_t){
         .i2c_bus = (i2c_master_bus_handle_t)i2c_bus,
+        .ae_target = CONFIG_BOARD_CSI_AE_TARGET, /* 0 = ISP default */
     };
     config.camera_driver = &board_pipeline_csi_driver;
     config.camera_config = &s_csi_config;
