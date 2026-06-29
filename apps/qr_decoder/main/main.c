@@ -45,6 +45,8 @@ static const char *TAG = "qr_decoder";
 static lv_obj_t *fps_label = NULL;
 #endif
 static cam_pipeline_handle_t s_pipeline = NULL;
+static cam_pipeline_qr_handle_t s_qr = NULL;  /* for reliability stats in HUD */
+static uint32_t s_square = 0;                 /* active decode square (HUD) */
 
 /* Exponential moving average smoothing */
 #define EMA_ALPHA_SLOW  0.3f   /* ~3 sec settle for stable rates */
@@ -96,7 +98,7 @@ static void update_fps_stats(void)
         ema_det  = EMA_ALPHA_FAST * det_fps             + (1 - EMA_ALPHA_FAST) * ema_det;
     }
 
-    char buf[80];
+    char buf[128];
 #if BOARD_DISPLAY_DRIVER != DISPLAY_ST7701
 #if BOARD_LANDSCAPE
     /* One stat per line — fits the narrow 80px landscape gap strip */
@@ -108,9 +110,25 @@ static void update_fps_stats(void)
 #endif
     overlay_text_set_fps(s_overlay, buf);
 #else
-    /* DSI: LVGL labels — landscape or portrait */
-    snprintf(buf, sizeof(buf), "cam: %.0f  disp: %.0f\nscan: %.0f  det: %.0f",
-             ema_cam, ema_disp, ema_scan, ema_det);
+    /* DSI: benchmark HUD — square + pipeline fps + QR decode reliability.
+     * The id%/ok% pair is the resolution-sweep headline (see cam_pipeline_qr):
+     * high id% + low ok% = square locates the QR but can't resolve its modules. */
+    cam_pipeline_qr_debug_stats_t qr_stats;
+    if (cam_pipeline_qr_get_debug_stats(s_qr, &qr_stats)) {
+        /* px/module of the last decode is a live distance readout — lets the
+         * tester step distance to specific px/module values during a sweep. */
+        snprintf(buf, sizeof(buf),
+                 "sq%lu  cam%.0f disp%.0f dec%.0f\n"
+                 "id%.0f%% ok%.0f%%  det%.1f/s  %.1fpx/m",
+                 (unsigned long)s_square, ema_cam, ema_disp,
+                 qr_stats.decode_fps, qr_stats.identify_pct,
+                 qr_stats.decode_pct, qr_stats.detections_per_sec,
+                 qr_stats.last_px_per_module);
+    } else {
+        snprintf(buf, sizeof(buf),
+                 "sq%lu  cam%.0f disp%.0f\nscan%.0f det%.0f",
+                 (unsigned long)s_square, ema_cam, ema_disp, ema_scan, ema_det);
+    }
     if (fps_label) {
         lv_label_set_text(fps_label, buf);
     }
@@ -140,6 +158,10 @@ static void fps_timer_cb(lv_timer_t *timer)
 #if BOARD_DISPLAY_DRIVER == DISPLAY_ST7701
 static lv_obj_t *qr_label = NULL;
 #endif
+
+/* Monotonic decode count for the compact on-screen flash (always available,
+ * independent of the debug-stats build). */
+static volatile uint32_t s_decode_seq = 0;
 
 #define QR_DISPLAY_TIMEOUT_MS  2000
 
@@ -194,13 +216,21 @@ static void on_qr_decoded(const uint8_t *payload, size_t len,
         ESP_LOGI(TAG, "QR decoded (%zu bytes): %s", len, text);
     }
 
+    /* Compact decode flash: a clean pulse + count + size, not a wall of
+     * payload (the full payload is in the serial log above). Lets the tester
+     * eyeball the decode rate against the QR animation. */
+    uint32_t seq = __atomic_add_fetch(&s_decode_seq, 1, __ATOMIC_RELAXED);
+    char flash[48];
+    snprintf(flash, sizeof(flash), LV_SYMBOL_OK " #%lu  %lu B",
+             (unsigned long)seq, (unsigned long)len);
+
 #if BOARD_DISPLAY_DRIVER != DISPLAY_ST7701
     /* SPI dummy-draw: direct overlay (no LVGL lock needed) */
-    overlay_text_set_qr(s_overlay, text, QR_DISPLAY_TIMEOUT_MS);
+    overlay_text_set_qr(s_overlay, flash, QR_DISPLAY_TIMEOUT_MS);
 #else
     if (lvgl_port_lock(50)) {
         if (qr_label) {
-            lv_label_set_text(qr_label, text);
+            lv_label_set_text(qr_label, flash);
             lv_obj_clear_flag(qr_label, LV_OBJ_FLAG_HIDDEN);
         }
 
@@ -257,9 +287,20 @@ void app_main(void)
 
     /* Square crop: use shorter logical dimension for both axes.
      * Camera fill+crop produces a square frame — no wasted pixels for
-     * the QR consumer, and the LVGL display driver centers it. */
+     * the QR consumer, and the LVGL display driver centers it.
+     *
+     * Phase-1 spike: CONFIG_QR_DECODE_SQUARE overrides the side length so the
+     * sensor-mode x square sweep can be driven per-build from sdkconfig. 0 =
+     * auto (shorter display dimension, the previous behavior). */
     uint32_t square = (BOARD_DISP_H_RES < BOARD_DISP_V_RES)
                           ? BOARD_DISP_H_RES : BOARD_DISP_V_RES;
+#if CONFIG_QR_DECODE_SQUARE > 0
+    square = CONFIG_QR_DECODE_SQUARE;
+#endif
+    ESP_LOGI(TAG, "QR decode square: %u px", (unsigned)square);
+#ifdef CONFIG_CAM_PIPELINE_DEBUG
+    s_square = square;
+#endif
     pipeline_cfg.display_width = square;
     pipeline_cfg.display_height = square;
 
@@ -321,6 +362,9 @@ void app_main(void)
         lv_label_set_long_mode(qr_label, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_color(qr_label, lv_color_hex(0x00FF00), 0);
         lv_obj_set_style_text_font(qr_label, &lv_font_montserrat_24, 0);
+        /* Backing so the HUD stays readable over a frame-filling QR */
+        lv_obj_set_style_bg_color(qr_label, lv_color_hex(0x000000), 0);
+        lv_obj_set_style_bg_opa(qr_label, LV_OPA_70, 0);
         lv_obj_set_style_pad_all(qr_label, 8, 0);
         lv_obj_align(qr_label, LV_ALIGN_BOTTOM_MID, 0, -10);
         lv_label_set_text(qr_label, "");
@@ -332,6 +376,9 @@ void app_main(void)
         lv_obj_set_style_text_color(fps_label, lv_color_hex(0xFFFFFF), 0);
         lv_obj_set_style_text_font(fps_label, &lv_font_montserrat_24, 0);
         lv_obj_set_style_text_align(fps_label, LV_TEXT_ALIGN_CENTER, 0);
+        /* Backing so the HUD stays readable over a frame-filling QR */
+        lv_obj_set_style_bg_color(fps_label, lv_color_hex(0x000000), 0);
+        lv_obj_set_style_bg_opa(fps_label, LV_OPA_70, 0);
         lv_obj_set_style_pad_ver(fps_label, 8, 0);
         lv_obj_align(fps_label, LV_ALIGN_TOP_MID, 0, 0);
         lv_label_set_text(fps_label, "---");
@@ -373,6 +420,9 @@ void app_main(void)
     if (!qr) {
         ESP_LOGE(TAG, "QR consumer creation failed");
     }
+#ifdef CONFIG_CAM_PIPELINE_DEBUG
+    s_qr = qr;
+#endif
 
     board_backlight_set(100);
 
