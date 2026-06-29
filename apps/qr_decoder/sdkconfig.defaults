@@ -32,9 +32,11 @@ CONFIG_K_QUIRC_CONTRAST_STRETCH=y
 # Decode-resolution sweep knob (0 = auto/480). Set per sweep build.
 CONFIG_QR_DECODE_SQUARE=0
 
-# CSI auto-exposure target — dial exposure back so bright laptop-screen QR
-# highlights don't clip (blowout). 0 = ISP default (over-exposes screens).
-CONFIG_BOARD_CSI_AE_TARGET=70
+# CSI auto-exposure target. 0 = ISP default (brighter — blows out screen
+# highlights, which HELPS a binary QR: short exposure + low gain = high SNR, no
+# motion blur, clipped white modules are harmless). Empirically a bright/
+# blown-out image decodes better than a dimmed one (dim -> sensor noise wins).
+CONFIG_BOARD_CSI_AE_TARGET=0
 
 # Debug metrics
 CONFIG_CAM_PIPELINE_DEBUG=y

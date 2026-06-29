@@ -188,19 +188,71 @@ slowly.
   `VIDIOC_S_FMT` engine hook exists (see the integration plan).
 - **High-density mode + BBQr-max.** Requires extending the k_quirc version DB
   past v25 (see `docs/knowledge/k-quirc-max-version-db-bound.md`).
-- **Manual focus slider.** The OV5647 module supports a VCM focus motor
-  (`CONFIG_CAMERA_OV5647_ISP_AF_ENABLE`) and the V4L2 stack exposes
-  `V4L2_CID_FOCUS_ABSOLUTE`; our CSI driver currently leaves `set_focus = NULL`.
-  Deliberately NOT doing autofocus (problematic). Future: wire a manual
-  `set_focus` + a UI slider for fixed-distance focus tuning. (On-hardware: confirm
-  the specific module has the VCM populated.)
+- **Focus is a manually-threaded lens, no software control.** The bundled "with
+  camera" OV5647 (small flex-PCB module, verified from Waveshare's product photo)
+  has a **threaded, notched lens barrel — manually rotatable to focus** — and **no
+  VCM motor** (the OV5647 driver's `CONFIG_CAMERA_OV5647_ISP_AF_ENABLE` /
+  `V4L2_CID_FOCUS_ABSOLUTE` path is moot here). Factory focus sits ~1 ft; QR
+  filling the frame needs ~7 in. **Refocus by rotating the lens** (notches take a
+  focus tool; likely a light factory thread-lock to overcome — not a destructive
+  glue break). Software cannot move it. This is the dominant decode limiter for
+  dense QRs (see §10). Use the live `px/m` HUD + decode flash to set sharp at 7 in.
 
-## 9. Exposure (implemented)
+## 9. Exposure — brighter is better (counterintuitive, verified)
 
-Auto-exposure runs (ISP pipeline controller + IPA), but the AE *setpoint* was the
-sensor/ISP default (`ae_target = 0`), which over-exposes bright backlit screens —
-QR module highlights clip and decode fails at close range even with ample
-px/module (a likely cause of the 3-of-5 inverted-distance oddity). Fixed via
-`CONFIG_BOARD_CSI_AE_TARGET` (default 70 for `qr_decoder`); tune per build. The
-RAW10 1280×960 binning mode also adds AE oscillation / harsh contrast — revisit
-with the sensor-mode sweep.
+**For a binary QR target, a bright / slightly-blown-out image decodes best.** You
+only need to distinguish black from white, so: brightness → short exposure + low
+gain → high SNR + no motion blur; clipped white modules are harmless. Dimming
+(longer exposure / higher gain) adds sensor noise + blur and *worsens* decode —
+confirmed on-device: a dimmed screen read *worse*, a slightly-blown-out screen
+read best.
+
+So the AE *setpoint* should be **bright, not dialled back**. `ae_target = 0` (ISP
+default) is the bright behavior and is the keeper (`CONFIG_BOARD_CSI_AE_TARGET=0`).
+An earlier attempt to lower it (70) to "avoid blowout" was the wrong direction.
+Measured effect of bright + good focus (480 square): misses dropped **840 → 134**,
+success rate ~30% → ~60%, all of 77/85/93-mod at **~4.3–5.0 decodes/s**.
+
+Open: `0` = whatever the ISP picks (nondeterministic) — consider pinning an
+explicit bright value. Separately, the RAW10 1280×960 binning mode's AE loop
+**oscillates** (hunts brighter/darker each frame); since brightness itself helps,
+the fix is to *stabilize* the loop bright (IPA AE damping / a fixed bright
+exposure), NOT to dim it. NOTE: the narrow RAW8 crop modes were tried earlier and
+rejected — too narrow a FOV to aim — so RAW8 is **not** the AE fix here; stay on
+the wide binning mode and stabilize its exposure.
+
+## 10. Empirical findings — focus is the dominant limiter (480/360 sweep)
+
+Clean-chain runs with the new per-decode px/module instrumentation:
+
+- **Empirical decode floor ≈ 2 px/module** — below the 3-px/module rule of thumb.
+  Observed successful decodes down to 1.87 (93-mod), 2.08 (77-mod), 2.47 (85-mod)
+  in good light with contrast stretch.
+- **Fixed focus caps usable frame-fill at ~63%.** Successful decodes never
+  exceeded side_px ≈ 312 on the 480 square (≈65% fill) or ≈224 on 360 (≈62%) —
+  the same fill fraction, because focus is a property of the glued lens, not the
+  output square. Beyond that the image blurs (mostly `ECC failure` QRMISS: grid
+  located + read, modules corrupted).
+- **Square sweep is therefore answered: bigger is strictly better.** px/module
+  scales with the square at fixed fill, so 480 (median 3.10 px/mod, 85-mod) beats
+  360 (median 1.96) — 360 fell below the floor (31 vs 112 decodes). 480 is the
+  panel-max landscape square and is only *marginal*.
+- **The wall:** at ~63% fill even 480 tops out ~3.5 px/mod for the 85-mod
+  baseline. Reaching the comfortable 4.5–5 px/mod needs ~90% fill, i.e. the ~7 in
+  close focus — unobtainable by changing the square (480 is max). So the dense
+  baseline is **focus-bound, not square-bound**, until the lens is refocused
+  closer (the physical glue-twist mod, §8). After that, smaller squares regain
+  fps headroom (90% fill @ 320 ≈ 3.4 px/mod).
+- **Refocusing closer cleared the wall.** After turning the lens (CCW = closer)
+  to fill the frame, the 81/85-mod animated UR decodes at **~3.5–5 decodes/s**
+  (1:1 with Sparrow's 5 fps) at px/mod ~3.5–4.5 — the must-scan baseline is met
+  with the wide binning mode + bright exposure. ~3.5 px/mod is empirically enough;
+  no need to chase 5.
+- **Sparrow renders all QRs at a fixed physical size**, so one fixed focus covers
+  the whole corpus — density just changes px/module (denser = lower). The densest
+  target is the limiter; everything sparser is automatic.
+- **Normal-density BBQr is v27 (125 modules)** — it returned *zero* reads under
+  `MAX_VERSION=25` (rejected at identify, no decode attempted). BBQr-low (89/v18)
+  read fine. Fixed by restoring k_quirc version DB entries 26–27 and raising
+  `MAX_VERSION` to 27 (§ k-quirc-max-version-db-bound). It remains the densest =
+  lowest-px/module target, so expect it slowest even once decodable.
