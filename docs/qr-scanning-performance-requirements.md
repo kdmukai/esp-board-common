@@ -176,6 +176,13 @@ slowly.
 
 ## 8. Future research areas (not in Phase 1 scope)
 
+- **Lower-resolution (smaller PPA square) retest — DEFERRED.** Not yet rerun after
+  the focus refinement. Hypothesis (see §10): with the improved focus (higher
+  fill → higher px/module), a smaller output square (~320–360) should keep the
+  common targets above the decode floor *and* run quirc faster → more animated
+  throughput, while the densest (BBQr-max v27) likely still needs 480 → a
+  **two-tier square**. To run: rebuild `sweep_320/360` current (AE=0 + integrated
+  k_quirc), measure per fixture the decode-fps gain vs where each drops out.
 - **Perspective skew (priority).** Off-axis capture foreshortens the QR so
   px/module varies across the code and the grid sampling degrades. More likely in
   real handheld use than rotation, and a plausible decode-floor limiter — worth
