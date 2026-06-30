@@ -81,15 +81,16 @@ Replace the success-only `on_decoded` with a **unified per-frame outcome callbac
 
 ```c
 typedef enum {
-    CAM_QR_FRAME_NOTHING = 0,  // no code located
-    CAM_QR_FRAME_MISS,         // located (corners valid) but decode failed
-    CAM_QR_FRAME_DECODED,      // decoded — payload/meta valid
-} cam_qr_frame_outcome_t;
+    CAM_QR_NOTHING = 0,  // no code located
+    CAM_QR_MISS,         // located (corners valid) but decode failed
+    CAM_QR_DECODED,      // decoded — payload/meta valid
+} cam_pipeline_qr_outcome_t;
 
-// payload/meta valid iff DECODED.
-typedef void (*cam_qr_frame_cb_t)(cam_qr_frame_outcome_t outcome,
-                                  const uint8_t *payload, size_t len,
-                                  const k_quirc_data_t *meta, void *user_ctx);
+// payload/meta valid iff DECODED. Set on the config as the `on_frame` field.
+typedef void (*cam_pipeline_qr_frame_cb_t)(cam_pipeline_qr_outcome_t outcome,
+                                           const uint8_t *payload, size_t len,
+                                           const k_quirc_data_t *meta,
+                                           void *user_ctx);
 ```
 
 - Per-frame rule (applied after the decode loop): `DECODED` if any code decoded
@@ -138,8 +139,12 @@ typedef enum {                 // mirrors Python DecodeQRStatus; NOT the overlay
 } scan_frame_status_t;
 ```
 
-- `present` receives the four states above. `COMPLETE` is NOT a dot state — it routes to
-  `on_complete` (a terminal control-flow event, not a render).
+- `present` receives the four states above. There is no `SCAN_FRAME_COMPLETE` dot state —
+  completion routes to `on_complete` (a terminal control-flow event). Note the
+  implementation still emits one final `present(SCAN_FRAME_NEW, percent)` (typically
+  100%) for the completing part *before* firing `on_complete`, so a presenter sees the
+  bar reach 100% with a green dot, then the terminal callback. The completion transition
+  should be driven from `on_complete`, not from a distinct frame status.
 - `NEW/REPEAT/COMPLETE` come from the classifier (domain); `MISS/NONE` come straight
   from the engine outcome. So `scan_frame_status_t` defines its own vocabulary and does
   not depend on the overlay's `camera_overlay_frame_status_t`.
@@ -194,4 +199,13 @@ push callback for a non-blocking ring buffer + `qr_poll` (MicroPython thread con
 - The engine change touches `esp-camera-pipeline` (its public consumer contract) — small
   but deliberate; it is the one repo with CI, so update tests alongside. Note the engine
   lives here as a submodule and is also vendored in the builder's
-  `deps/esp-camera-pipeline` — keep both in sync.
+  `deps/esp-camera-pipeline` — keep both in sync. The `on_frame` callback (enum
+  `cam_pipeline_qr_outcome_t`, type `cam_pipeline_qr_frame_cb_t`) is already implemented
+  and pinned by `esp-board-common`; the builder's vendored copy is still on the old
+  `on_decoded` and must be bumped to the same engine commit.
+- **Dependency pinning during development.** While this work is in flight the builder
+  targets the *in-progress branches* of our bot forks, not upstream — concretely:
+  `seedsigner-lvgl-screens` → the `camera_preview_overlay` branch (overlay not yet
+  merged), `esp-camera-pipeline` + `board_common` → the `on_frame`/`scan_coordinator`
+  commits on `main` of the bot forks. Repointing any of these at upstream is deferred to
+  a later cleanup pass.
