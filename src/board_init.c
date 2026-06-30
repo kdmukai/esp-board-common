@@ -245,7 +245,9 @@ static void st7701_landscape_flush_cb(lv_display_t *disp,
     /* 90° CCW rotation: portrait(px, py) = landscape(DISP_W-1-py, px)
      * No byte swap needed for MIPI-DSI (unlike SPI panels).
      * We rotate into the back buffer while the panel scans the front. */
+#ifdef CONFIG_CAM_PIPELINE_DEBUG
     int64_t t0 = esp_timer_get_time();
+#endif
 
     for (int px = 0; px < BOARD_LCD_H_RES; px++) {
         for (int py = 0; py < BOARD_LCD_V_RES; py++) {
@@ -254,6 +256,7 @@ static void st7701_landscape_flush_cb(lv_display_t *disp,
         }
     }
 
+#ifdef CONFIG_CAM_PIPELINE_DEBUG
     int64_t t1 = esp_timer_get_time();
     static int64_t disp_rot_sum = 0;
     static int64_t disp_rot_max = 0;
@@ -272,6 +275,7 @@ static void st7701_landscape_flush_cb(lv_display_t *disp,
         disp_rot_count = 0;
         disp_rot_last_log = t1;
     }
+#endif
 
     /* Wait for vsync, then submit draw_bitmap so the DMA copy runs
      * during the vertical blanking interval — not mid-scan. */

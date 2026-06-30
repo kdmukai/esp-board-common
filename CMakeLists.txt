@@ -21,6 +21,7 @@ set(SRC_FILES
     "src/board_audio.c"
     "src/overlay_text.c"
     "src/overlay_rotated.c"
+    "src/scan_coordinator.c"
 )
 
 # All dependencies listed unconditionally where possible. The #if BOARD_HAS_*
@@ -40,7 +41,7 @@ set(REQUIRED_COMPONENTS
     "fatfs" "nvs_flash"
     "espressif__esp_codec_dev"
     "waveshare__pcf85063a" "waveshare__qmi8658"
-    "esp-camera-pipeline"
+    "esp-camera-pipeline" "cam_pipeline_qr"
 )
 
 # MIPI-DSI display (ESP32-P4): ST7701 + LDO regulator
