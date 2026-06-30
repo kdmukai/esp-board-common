@@ -2,15 +2,17 @@
  * scan_coord_test — on-device validation of scan_coordinator (esp-board-common).
  *
  * Stands up the camera preview pipeline (like qr_decoder), then drives a
- * scan_coordinator with an INJECTED payload-dedup classifier and a serial-log
- * presenter. No SeedSigner / overlay dependency: this exercises the generic
- * coordinator seam — NEW/REPEAT/MISS/COMPLETE, percent, the state-change dedup,
- * and on_complete — before the builder wires the real overlay presenter on top.
+ * scan_coordinator via its POLL model: a consumer task drains the NEW(payload)
+ * ring, reads the coalesced status cell, and reports domain results back through
+ * a serial-log presenter. This mirrors the production MicroPython-task loop with
+ * no SeedSigner / overlay dependency, exercising the generic seam — NEW ring,
+ * REPEAT/MISS/NONE status, the sustained-MISS counter, present() dedup, and
+ * report_complete() — before the builder wires the real overlay presenter on top.
  *
  * By hand:
- *   - aim at a QR            -> PRESENT NEW  + percent tick
+ *   - aim at a QR            -> NEW part logged + PRESENT NEW + percent tick
  *   - hold it steady         -> PRESENT REPEAT once, then silence (dedup)
- *   - a located-but-unread QR-> PRESENT MISS
+ *   - a located-but-unread QR-> sustained-MISS count climbs (dot ignores it)
  *   - QR leaves view         -> PRESENT NONE
  *   - show N distinct codes  -> 100% then COMPLETE
  */
@@ -42,55 +44,8 @@ static const char *TAG = "scan_coord_test";
  * is easy to reach by hand with a few different QR codes. */
 #define COMPLETE_TARGET_PARTS 4
 
-/* ── Injected classifier: payload-dedup + synthetic percent ──
- * Runs in the decode-task context. v1 stand-in for DecodeQR: a payload that
- * differs from last time is a "new part"; the same payload is "already seen".
- * Real reassembly (fountain codes, formats) arrives later with Python DecodeQR.
- *
- * Identify a payload by length + an FNV-1a hash over the FULL bytes, so dedup is
- * correct at any size: UR/BBQr parts run ~600-2000+ bytes, so a fixed compare
- * buffer would truncate and misclassify true repeats as new. */
-static uint32_t s_last_hash = 0;
-static size_t   s_last_len  = 0;
-static bool     s_have_last = false;
-static int      s_distinct  = 0;
-
-static uint32_t fnv1a(const uint8_t *data, size_t len)
-{
-    uint32_t h = 2166136261u;
-    for (size_t i = 0; i < len; i++) {
-        h = (h ^ data[i]) * 16777619u;
-    }
-    return h;
-}
-
-static scan_classify_result_t test_classify(void *ctx, const uint8_t *payload,
-                                            size_t len, int *out_percent)
-{
-    (void)ctx;
-    uint32_t hash = fnv1a(payload, len);
-    bool same = s_have_last && (len == s_last_len) && (hash == s_last_hash);
-    if (!same) {
-        s_last_hash = hash;
-        s_last_len = len;
-        s_have_last = true;
-        if (s_distinct < COMPLETE_TARGET_PARTS) {
-            s_distinct++;
-        }
-    }
-
-    int pct = s_distinct * 100 / COMPLETE_TARGET_PARTS;
-    if (pct > 100) {
-        pct = 100;
-    }
-    *out_percent = pct;
-
-    if (same) {
-        return SCAN_CLASSIFY_REPEAT;
-    }
-    return (s_distinct >= COMPLETE_TARGET_PARTS) ? SCAN_CLASSIFY_COMPLETE
-                                                 : SCAN_CLASSIFY_NEW;
-}
+/* Coordinator handle, shared with the consumer task. */
+static scan_coordinator_t *s_coord = NULL;
 
 /* ── Injected presenter: serial log on each state CHANGE (coordinator dedups) ── */
 static const char *status_name(scan_frame_status_t s)
@@ -114,6 +69,89 @@ static void test_complete(void *ctx)
 {
     (void)ctx;
     ESP_LOGI(TAG, "COMPLETE — %d distinct parts assembled", COMPLETE_TARGET_PARTS);
+}
+
+/* ── Consumer task: the poll loop (mirrors the production MicroPython-task loop) ──
+ * The coordinator already did transport dedup, so each NEW ring payload is a
+ * fresh (bytes-differ) part. v1 "DecodeQR" stand-in: count distinct parts ->
+ * percent -> COMPLETE. The status cell drives the dot for non-decode frames; the
+ * MISS counter is a sustained-miss signal (logged, dot ignores it). */
+static void consumer_task(void *param)
+{
+    (void)param;
+    int distinct = 0;
+    uint32_t last_cmiss = 0;
+    uint32_t last_dropped = 0;
+    bool sustained_warned = false;
+    /* Illustrative consumer-side policy only (the real threshold is Python's in the
+     * eventual integration). Device data: a dense descriptor scanned too-far/out-of-
+     * focus produced runs up to ~32 before the user corrected, so 60 clears a still-
+     * recoverable scan while still flagging a genuinely stuck one. See
+     * docs/camera-pipeline-phase2-poll-contract.md §7. */
+    const uint32_t SUSTAINED_MISS_THRESHOLD = 60;
+
+    while (true) {
+        /* 1) Drain the precious NEW ring fully. */
+        scan_new_event_t ev;
+        while (scan_coordinator_poll_new(s_coord, &ev)) {
+            if (distinct < COMPLETE_TARGET_PARTS) {
+                distinct++;
+            }
+            int pct = distinct * 100 / COMPLETE_TARGET_PARTS;
+            if (pct > 100) {
+                pct = 100;
+            }
+            ESP_LOGI(TAG, "NEW part: %u bytes (distinct=%d/%d)",
+                     (unsigned)ev.len, distinct, COMPLETE_TARGET_PARTS);
+            if (distinct >= COMPLETE_TARGET_PARTS) {
+                scan_coordinator_report(s_coord, SCAN_FRAME_NEW, 100);
+                scan_coordinator_report_complete(s_coord);
+            } else {
+                scan_coordinator_report(s_coord, SCAN_FRAME_NEW, pct);
+            }
+        }
+
+        /* 2) Read coalesced status; drive the dot for non-decode frames. */
+        scan_status_t st;
+        scan_coordinator_read_status(s_coord, &st);
+        int pct = distinct * 100 / COMPLETE_TARGET_PARTS;
+        if (pct > 100) {
+            pct = 100;
+        }
+        if (st.latest == SCAN_FRAME_REPEAT) {
+            scan_coordinator_report(s_coord, SCAN_FRAME_REPEAT, pct);
+        } else if (st.latest == SCAN_FRAME_NONE) {
+            scan_coordinator_report(s_coord, SCAN_FRAME_NONE, pct);
+        }
+        /* NEW is handled via the ring above; MISS is ignored for the dot. */
+
+        /* 3) Sustained-MISS detection (consumer policy on the consecutive counter,
+         *    which the coordinator resets on any decode). Warn once per run when it
+         *    crosses the threshold; clear the latch when a decode resets the run. */
+        if (st.consecutive_misses != last_cmiss) {
+            if (st.consecutive_misses > last_cmiss) {
+                ESP_LOGI(TAG, "MISS run=%u", (unsigned)st.consecutive_misses);
+                if (!sustained_warned &&
+                    st.consecutive_misses >= SUSTAINED_MISS_THRESHOLD) {
+                    ESP_LOGW(TAG, "SUSTAINED MISS (run>=%u, no decode) — "
+                             "found-but-unreadable? (damaged / bad transcription)",
+                             (unsigned)SUSTAINED_MISS_THRESHOLD);
+                    sustained_warned = true;
+                }
+            } else {
+                /* Run reset by a decode -> rearm the warning. */
+                sustained_warned = false;
+            }
+            last_cmiss = st.consecutive_misses;
+        }
+        if (st.dropped_new != last_dropped) {
+            ESP_LOGW(TAG, "NEW ring overflow: %u parts dropped (total=%u)",
+                     (unsigned)(st.dropped_new - last_dropped), (unsigned)st.dropped_new);
+            last_dropped = st.dropped_new;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
 }
 
 /* ── Delayed flash-log dump (waits for USB serial reconnect) ── */
@@ -168,21 +206,23 @@ void app_main(void)
     }
 
     /* The coordinator attaches a QR consumer to the running pipeline and routes
-     * per-frame outcomes through our injected classifier -> dedup -> presenter. */
+     * per-frame outcomes into the NEW ring + status cell. A consumer task (below)
+     * polls it; present()/on_complete() fire from there, on the consumer task. */
     scan_coordinator_config_t coord_cfg = {
-        .pipeline     = pipeline,
-        .frame_width  = square,
-        .frame_height = square,
-        .classify     = test_classify,
-        .classify_ctx = NULL,
-        .present      = test_present,
-        .present_ctx  = NULL,
-        .on_complete  = test_complete,
-        .complete_ctx = NULL,
+        .pipeline       = pipeline,
+        .frame_width    = square,
+        .frame_height   = square,
+        .present        = test_present,
+        .present_ctx    = NULL,
+        .on_complete    = test_complete,
+        .complete_ctx   = NULL,
+        .new_ring_depth = 0,  /* default */
     };
-    scan_coordinator_t *coord = scan_coordinator_create(&coord_cfg);
-    if (!coord) {
+    s_coord = scan_coordinator_create(&coord_cfg);
+    if (!s_coord) {
         ESP_LOGE(TAG, "scan_coordinator creation failed");
+    } else {
+        xTaskCreate(consumer_task, "scan_consumer", 4096, NULL, 4, NULL);
     }
 
     board_backlight_set(100);
