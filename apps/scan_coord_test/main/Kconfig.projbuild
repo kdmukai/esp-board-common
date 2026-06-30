@@ -1,0 +1,18 @@
+menu "QR decoder spike"
+
+    config QR_DECODE_SQUARE
+        int "PPA output / QR decode square size (px, 0 = auto)"
+        default 0
+        range 0 800
+        help
+            Side length of the square frame the camera PPA produces and that
+            the QR consumer (quirc) runs on. This is the Phase-1 spike's master
+            knob: smaller = faster quirc + less PSRAM traffic, bounded below by
+            >=3 px/module for the worst-case QR.
+
+            0 means "auto": use the shorter logical display dimension (the
+            previous hardcoded behavior). Any non-zero value overrides it, so
+            the sweep can be driven per-build from sdkconfig with no source
+            edits. Typical sweep points: 480, 320, 240.
+
+endmenu
