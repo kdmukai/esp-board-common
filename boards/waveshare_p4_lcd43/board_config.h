@@ -62,11 +62,26 @@
 #define BOARD_HAS_PMIC          0
 
 /* ── LVGL port tuning ── */
-#define BOARD_LVGL_TASK_PRIORITY    5
+/* Flattened to 1 (== MicroPython VM task) so LVGL-lock access is FIFO-fair and the
+ * prio-1 VM/consumer doesn't starve at overlay-create / present(). A/B-confirmed not
+ * to affect preview fps (prio-5 firmware measured the same). See board_common note. */
+#define BOARD_LVGL_TASK_PRIORITY    1
 #define BOARD_LVGL_TASK_STACK       (1024 * 16)
 #define BOARD_LVGL_TASK_AFFINITY    -1  /* No core affinity */
 #define BOARD_LVGL_MAX_SLEEP_MS     500
 #define BOARD_LVGL_TIMER_PERIOD_MS  5
+
+/* ── ST7701 deferred-flush task ──
+ * The landscape flush does a ~30ms CPU rotation + vsync wait + panel blit. It
+ * runs on this task so that work happens OFF the LVGL lock (see board_init.c).
+ * Prio 1 == the flatten baseline: it must NOT preempt the lvgl render (which
+ * holds the lock), and it does not take the LVGL mutex itself, so equal prio is
+ * safe for mutex fairness. Core/priority are tuning knobs — if the flush task
+ * gets starved (wait_for_flushing stalls under the lock), try raising the
+ * priority or pinning to core 1. */
+#define BOARD_ST7701_FLUSH_TASK_PRIORITY   1
+#define BOARD_ST7701_FLUSH_TASK_STACK      4096
+#define BOARD_ST7701_FLUSH_TASK_AFFINITY   -1  /* tskNO_AFFINITY */
 
 /* ── Camera (MIPI-CSI, OV5647) ── */
 #ifndef BOARD_HAS_CAMERA

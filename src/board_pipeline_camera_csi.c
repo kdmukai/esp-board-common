@@ -34,7 +34,9 @@ static const char *TAG = "pipeline_cam_csi";
 
 #define CSI_NUM_BUFS      3
 #define CSI_TASK_STACK     (16 * 1024)
-#define CSI_TASK_PRIORITY  5
+/* Flattened to 1 (== lvgl + MicroPython VM tasks) for FIFO-fair LVGL-lock access;
+ * see BOARD_LVGL_TASK_PRIORITY note. Dropped frames are acceptable here. */
+#define CSI_TASK_PRIORITY  1
 
 /* AE target: 2-235 range per esp_video ISP pipeline.
  * Higher = brighter exposure. 128 = neutral. Kern defaults to 80.
