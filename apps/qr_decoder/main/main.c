@@ -185,13 +185,20 @@ static void fade_timer_cb(lv_timer_t *timer)
 #endif /* DISPLAY_ST7701 */
 
 /**
- * QR decode callback — called from QR decode task (Core 1).
- * Updates the overlay label with decoded text.
+ * Per-frame QR callback — called from QR decode task (Core 1).
+ * This raw decoder reacts only to successful decodes (its prior on_decoded
+ * behavior); MISS/NOTHING frames are ignored. Updates the overlay with the
+ * decoded text.
  */
-static void on_qr_decoded(const uint8_t *payload, size_t len,
-                          const k_quirc_data_t *metadata, void *user_ctx)
+static void on_qr_frame(cam_pipeline_qr_outcome_t outcome,
+                        const uint8_t *payload, size_t len,
+                        const k_quirc_data_t *metadata, void *user_ctx)
 {
     (void)user_ctx;
+
+    if (outcome != CAM_QR_DECODED) {
+        return;
+    }
 
 #ifdef CONFIG_CAM_PIPELINE_DEBUG
     __atomic_add_fetch(&s_detect_count, 1, __ATOMIC_RELAXED);
@@ -413,7 +420,7 @@ void app_main(void)
         .pipeline     = pipeline,
         .frame_width  = square,
         .frame_height = square,
-        .on_decoded   = on_qr_decoded,
+        .on_frame     = on_qr_frame,
         .user_ctx     = NULL,
     };
     cam_pipeline_qr_handle_t qr = cam_pipeline_qr_create(&qr_cfg);

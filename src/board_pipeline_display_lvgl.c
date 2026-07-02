@@ -124,6 +124,7 @@ static bool push_frame_image_widget(lvgl_display_ctx_t *ctx,
 
     lvgl_port_unlock();
 
+#ifdef CONFIG_CAM_PIPELINE_DEBUG
     /* Measure interval between consecutive successful pushes */
     static int64_t last_push = 0;
     static int64_t interval_sum = 0;
@@ -147,6 +148,7 @@ static bool push_frame_image_widget(lvgl_display_ctx_t *ctx,
         }
     }
     last_push = now;
+#endif
 
     return true;
 }
