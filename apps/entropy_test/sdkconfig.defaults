@@ -1,0 +1,41 @@
+# entropy_test — shared settings for all boards
+
+# Partition table
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+
+# Task watchdog
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+
+# CSI camera (ESP32-P4 boards with OV5647)
+CONFIG_CAMERA_OV5647=y
+CONFIG_CAMERA_OV5647_MIPI_RAW10_1280x960_BINNING_45FPS=y
+CONFIG_ESP_VIDEO_ENABLE_ISP_PIPELINE_CONTROLLER=y
+
+# Disable task WDT — camera DQBUF blocks the idle task
+CONFIG_ESP_TASK_WDT_EN=n
+# FreeRTOS timer task needs more stack for camera/ISP
+CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=4096
+
+# CSI auto-exposure target (0 = ISP default)
+CONFIG_BOARD_CSI_AE_TARGET=0
+
+# Hardware SHA-256 acceleration (ESP32-P4 SHA peripheral) for frame hashing
+CONFIG_MBEDTLS_HARDWARE_SHA=y
+
+# Pipeline fps HUD ON — confirms preview frames are flowing during hashing.
+CONFIG_CAM_PIPELINE_DEBUG=y
+
+# LVGL fonts
+CONFIG_LV_FONT_MONTSERRAT_14=y
+CONFIG_LV_FONT_MONTSERRAT_24=y
+
+# Core dump to flash — captures crash backtraces for post-mortem analysis
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
+CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y
+CONFIG_ESP_COREDUMP_CAPTURE_DRAM=y
+
+# Boot log to flash — captures complete boot log, survives reboot
+CONFIG_BOARD_LOG_TO_FLASH=y
