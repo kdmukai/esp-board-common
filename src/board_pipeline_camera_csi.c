@@ -5,10 +5,12 @@
  * pipeline (RAW8 → RGB565) runs internally via
  * CONFIG_ESP_VIDEO_ENABLE_ISP_PIPELINE_CONTROLLER.
  *
- * init()  — opens V4L2 device, allocates buffers, queues them
+ * init()  — inits esp_video ONCE per boot, opens V4L2 device, allocates
+ *           buffers, queues them
  * start() — begins streaming and spawns a capture task
  * stop()  — stops streaming and joins the capture task
- * deinit()— frees buffers and closes the device
+ * deinit()— frees buffers and closes the device; leaves esp_video registered
+ *           (no public esp_video_deinit exists — see s_esp_video_inited)
  */
 #include "board.h"
 #include "board_config.h"
@@ -32,9 +34,20 @@
 
 static const char *TAG = "pipeline_cam_csi";
 
+/* esp_video registers board-global singletons (ISP/CSI video devices, the ISP
+ * pipeline-controller task, the MIPI LDO channel) and exposes NO public
+ * esp_video_deinit() — the ISP controller task handle isn't even retained, so
+ * it cannot be stopped. Registering twice fails ("video name=ISP id=20 has
+ * been registered"), which is why an in-boot pipeline stop/start used to force
+ * a machine.reset(). Init it exactly once per boot and leave it registered;
+ * subsequent scan cycles just re-open the V4L2 device + re-REQBUFS/STREAMON. */
+static bool s_esp_video_inited = false;
+
 #define CSI_NUM_BUFS      3
 #define CSI_TASK_STACK     (16 * 1024)
-#define CSI_TASK_PRIORITY  5
+/* Flattened to 1 (== lvgl + MicroPython VM tasks) for FIFO-fair LVGL-lock access;
+ * see BOARD_LVGL_TASK_PRIORITY note. Dropped frames are acceptable here. */
+#define CSI_TASK_PRIORITY  1
 
 /* AE target: 2-235 range per esp_video ISP pipeline.
  * Higher = brighter exposure. 128 = neutral. Kern defaults to 80.
@@ -131,11 +144,18 @@ static void *csi_init(const void *platform_config)
     }
     esp_video_init_config_t cam_config = { .csi = csi_config };
 
-    esp_err_t err = esp_video_init(&cam_config);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_video_init failed: %s", esp_err_to_name(err));
-        free(ctx);
-        return NULL;
+    /* Init once per boot; never deinit (see s_esp_video_inited note above).
+     * A second esp_video_init() would fail registering the already-present
+     * ISP/CSI devices, so skip it on re-arm — the devices persist and the
+     * fresh open()/REQBUFS below re-attaches this driver instance to them. */
+    if (!s_esp_video_inited) {
+        esp_err_t err = esp_video_init(&cam_config);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_video_init failed: %s", esp_err_to_name(err));
+            free(ctx);
+            return NULL;
+        }
+        s_esp_video_inited = true;
     }
 
     /* Open V4L2 device */
@@ -268,13 +288,16 @@ static void csi_deinit(void *handle)
     csi_driver_ctx_t *ctx = (csi_driver_ctx_t *)handle;
     if (!ctx) return;
 
+    /* Release only this instance's V4L2 session (fd + buffers). The esp_video
+     * device registrations stay up by design (see s_esp_video_inited) so the
+     * next cam_pipeline_create() can re-open the device without a reboot. */
     for (int i = 0; i < CSI_NUM_BUFS; i++) {
         if (ctx->frame_bufs[i]) heap_caps_free(ctx->frame_bufs[i]);
     }
     if (ctx->video_fd >= 0) close(ctx->video_fd);
     free(ctx);
 
-    ESP_LOGI(TAG, "CSI driver deinitialized");
+    ESP_LOGI(TAG, "CSI driver deinitialized (esp_video kept registered)");
 }
 
 static esp_err_t csi_get_resolution(void *handle, uint32_t *width,

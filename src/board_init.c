@@ -200,6 +200,26 @@ static uint16_t *st7701_rot_buf[2] = {NULL, NULL};
 static int st7701_rot_idx = 0;
 static SemaphoreHandle_t dpi_flush_sem = NULL;
 
+/* Deferred flush: the 90° rotation + vsync-wait + panel blit run on this task,
+ * OFF the LVGL lock. esp_lvgl_port wraps lv_timer_handler (which calls the
+ * flush_cb) in the recursive LVGL mutex, so doing the ~30ms rotation + ~16ms
+ * vsync wait inline held the lock ~45ms longer per frame — long enough that the
+ * camera's non-blocking try-lock frame push (board_pipeline_display_lvgl.c)
+ * lost the race ~25% of the time and the preview stalled at ~8fps.  Handing the
+ * work to this task lets lv_timer_handler return as soon as the render finishes,
+ * dropping the per-frame lock hold from ~(render + rot + vsync) to ~render — i.e.
+ * below the camera's ~56ms produce cadence, so pushes stop getting skipped.
+ *
+ * This REQUIRES LV_DISPLAY_RENDER_MODE_FULL (set in lvgl_port_setup).  In DIRECT
+ * mode LVGL's refr_sync_areas() waits for the pending flush BEFORE the render
+ * (and also does a per-frame inter-buffer sync copy), both under the lock, which
+ * would re-serialize and cancel the benefit.  FULL mode's only cross-frame wait
+ * is in draw_buf_flush() AFTER the render, so the render of frame N overlaps the
+ * flush task rotating frame N-1. */
+static SemaphoreHandle_t st7701_flush_start_sem = NULL;  /* flush_cb  -> task     */
+static SemaphoreHandle_t st7701_flush_done_sem  = NULL;  /* task -> flush_wait_cb */
+static uint16_t *st7701_flush_fb = NULL;                 /* buffer handed to task */
+
 static bool dpi_vsync_ready_cb(esp_lcd_panel_handle_t panel,
                                esp_lcd_dpi_panel_event_data_t *edata,
                                void *user_ctx)
@@ -210,45 +230,30 @@ static bool dpi_vsync_ready_cb(esp_lcd_panel_handle_t panel,
 }
 
 /**
- * Landscape flush callback for MIPI-DSI (ST7701) displays.
+ * Rotate the just-rendered landscape frame 90° CCW into the portrait output
+ * buffer, then blit it to the panel synced to vsync.  Runs on the flush task,
+ * NOT under the LVGL lock.
  *
- * LVGL renders in landscape (V_RES × H_RES) with full_refresh.
- * This callback rotates pixels 90° CCW into a separate PSRAM buffer,
- * then calls draw_bitmap with physical portrait dimensions.
+ * DPI panels don't support partial updates or hardware rotation (MADCTL), so we
+ * rotate on the CPU.  No byte swap needed for MIPI-DSI (unlike SPI panels).
+ * The output is double-buffered (st7701_rot_buf[0/1]): we rotate into the back
+ * buffer while the panel scans the front.
  *
- * DPI panels don't support partial updates or hardware rotation (MADCTL).
- * esp_lvgl_port's full_refresh path uses LVGL's logical dimensions for
- * draw_bitmap, which breaks when rotation is applied to a panel that can't
- * actually rotate.  This custom callback bypasses that path entirely.
- *
- * Tearing prevention: draw_bitmap triggers a DMA2D copy to the panel's
- * internal frame buffer.  We wait for the on_refresh_done (vsync) callback
- * to confirm the new frame is being displayed before signaling flush_ready.
- * The drain take(0) discards any stale vsync that fired during rotation.
+ * Tearing prevention: draw_bitmap triggers a DMA2D copy into the panel's frame
+ * buffer.  We wait for the on_refresh_done (vsync) callback so the copy lands in
+ * the vertical blanking interval, not mid-scan.  The drain take(0) discards any
+ * stale vsync that fired during rotation.
  */
-static void st7701_landscape_flush_cb(lv_display_t *disp,
-                                      const lv_area_t *area, uint8_t *px_map)
+static void st7701_rotate_and_blit(uint16_t *fb)
 {
-    /* With full_refresh, LVGL sends one complete frame per flush cycle.
-     * This guard is a safety check — not band skipping. */
-    if (!lv_display_flush_is_last(disp)) {
-        lv_display_flush_ready(disp);
-        return;
-    }
-
-    /* Landscape framebuffer: V_RES wide, H_RES tall */
-    const int DISP_W = BOARD_LCD_V_RES;  /* e.g. 800 */
-
-    uint16_t *fb = (uint16_t *)px_map;
+    const int DISP_W = BOARD_LCD_V_RES;  /* landscape width, e.g. 800 */
     uint16_t *out = st7701_rot_buf[st7701_rot_idx];
 
-    /* 90° CCW rotation: portrait(px, py) = landscape(DISP_W-1-py, px)
-     * No byte swap needed for MIPI-DSI (unlike SPI panels).
-     * We rotate into the back buffer while the panel scans the front. */
 #ifdef CONFIG_CAM_PIPELINE_DEBUG
     int64_t t0 = esp_timer_get_time();
 #endif
 
+    /* 90° CCW rotation: portrait(px, py) = landscape(DISP_W-1-py, px) */
     for (int px = 0; px < BOARD_LCD_H_RES; px++) {
         for (int py = 0; py < BOARD_LCD_V_RES; py++) {
             int fb_x = DISP_W - 1 - py;
@@ -267,9 +272,11 @@ static void st7701_landscape_flush_cb(lv_display_t *disp,
     if (disp_rot_dur > disp_rot_max) disp_rot_max = disp_rot_dur;
     disp_rot_count++;
     if (t1 - disp_rot_last_log > 2000000) {  /* every 2s */
-        ESP_LOGI(TAG, "DISP CPU: avg=%lld us  max=%lld us  n=%d",
-                 (long long)(disp_rot_sum / disp_rot_count),
-                 (long long)disp_rot_max, disp_rot_count);
+        /* %d (not %lld): nano-printf (CONFIG_LIBC_NEWLIB_NANO_FORMAT) has no
+         * 64-bit conversion; us values fit in int. */
+        ESP_LOGI(TAG, "DISP CPU: avg=%d us  max=%d us  n=%d",
+                 (int)(disp_rot_sum / disp_rot_count),
+                 (int)disp_rot_max, disp_rot_count);
         disp_rot_sum = 0;
         disp_rot_max = 0;
         disp_rot_count = 0;
@@ -277,14 +284,60 @@ static void st7701_landscape_flush_cb(lv_display_t *disp,
     }
 #endif
 
-    /* Wait for vsync, then submit draw_bitmap so the DMA copy runs
-     * during the vertical blanking interval — not mid-scan. */
+    /* Wait for vsync, then submit draw_bitmap so the DMA copy runs during the
+     * vertical blanking interval — not mid-scan. */
     xSemaphoreTake(dpi_flush_sem, 0);             /* drain stale vsync */
     xSemaphoreTake(dpi_flush_sem, portMAX_DELAY); /* wait for vsync start */
     esp_lcd_panel_draw_bitmap(panel_handle, 0, 0,
                               BOARD_LCD_H_RES, BOARD_LCD_V_RES, out);
-    st7701_rot_idx ^= 1;                          /* swap buffers */
-    lv_display_flush_ready(disp);
+    st7701_rot_idx ^= 1;                          /* swap output buffers */
+}
+
+/* Flush worker: blocks until flush_cb hands off a rendered buffer, rotates +
+ * blits it (off the LVGL lock), then signals completion for flush_wait_cb. */
+static void st7701_flush_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        xSemaphoreTake(st7701_flush_start_sem, portMAX_DELAY);
+        st7701_rotate_and_blit(st7701_flush_fb);
+        xSemaphoreGive(st7701_flush_done_sem);
+    }
+}
+
+/**
+ * Landscape flush callback for MIPI-DSI (ST7701) displays.
+ *
+ * Hands the just-rendered buffer to the flush task and returns immediately —
+ * WITHOUT lv_display_flush_ready().  LVGL keeps disp->flushing set; the next
+ * draw_buf_flush() blocks in st7701_flush_wait_cb() until the task signals it.
+ * This is what moves the rotation + vsync wait off the LVGL lock.
+ */
+static void st7701_landscape_flush_cb(lv_display_t *disp,
+                                      const lv_area_t *area, uint8_t *px_map)
+{
+    /* FULL mode sends one complete frame per flush; this guard only matters if
+     * the render mode is ever changed back to a partial/direct variant. */
+    if (!lv_display_flush_is_last(disp)) {
+        lv_display_flush_ready(disp);
+        return;
+    }
+
+    st7701_flush_fb = (uint16_t *)px_map;
+    xSemaphoreGive(st7701_flush_start_sem);  /* wake the flush task; do NOT flush_ready */
+}
+
+/**
+ * flush_wait callback — LVGL calls this (from wait_for_flushing) when it needs
+ * the previous flush to complete before starting the next one.  Yields on a
+ * semaphore instead of the default busy-spin (while(disp->flushing)); LVGL
+ * clears disp->flushing after we return.  Paired 1:1 with flush_start (each
+ * frame gives done_sem once, each following frame takes it once).
+ */
+static void st7701_flush_wait_cb(lv_display_t *disp)
+{
+    (void)disp;
+    xSemaphoreTake(st7701_flush_done_sem, portMAX_DELAY);
 }
 
 #endif /* BOARD_DISPLAY_DRIVER == DISPLAY_ST7701 */
@@ -363,11 +416,29 @@ static void lvgl_port_setup(const board_app_config_t *app_cfg,
 
         dpi_flush_sem = xSemaphoreCreateBinary();
 
+        /* Deferred-flush plumbing — created BEFORE the display so the flush task
+         * is ready before esp_lvgl_port can call the flush_cb. */
+        st7701_flush_start_sem = xSemaphoreCreateBinary();
+        st7701_flush_done_sem  = xSemaphoreCreateBinary();
+        assert(st7701_flush_start_sem && st7701_flush_done_sem);
+        BaseType_t flush_core = (BOARD_ST7701_FLUSH_TASK_AFFINITY < 0)
+                                ? tskNO_AFFINITY
+                                : (BaseType_t)BOARD_ST7701_FLUSH_TASK_AFFINITY;
+        xTaskCreatePinnedToCore(st7701_flush_task, "st7701_flush",
+                                BOARD_ST7701_FLUSH_TASK_STACK, NULL,
+                                BOARD_ST7701_FLUSH_TASK_PRIORITY, NULL,
+                                flush_core);
+
         lvgl_port_lock(0);
         lv_display_t *disp = lv_display_create(lvgl_hres, lvgl_vres);
+        /* FULL (not DIRECT): keeps LVGL's only cross-frame wait_for_flushing in
+         * draw_buf_flush AFTER the render, so the render overlaps the deferred
+         * flush task.  DIRECT's refr_sync_areas would wait BEFORE the render
+         * (under the lock) and negate the win.  See st7701_flush_task comment. */
         lv_display_set_buffers(disp, buf1, buf2, draw_buf_sz,
-                               LV_DISPLAY_RENDER_MODE_DIRECT);
+                               LV_DISPLAY_RENDER_MODE_FULL);
         lv_display_set_flush_cb(disp, st7701_landscape_flush_cb);
+        lv_display_set_flush_wait_cb(disp, st7701_flush_wait_cb);
         lvgl_port_unlock();
 
         esp_lcd_dpi_panel_event_callbacks_t dpi_cbs = {
