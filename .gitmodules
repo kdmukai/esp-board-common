@@ -1,3 +1,3 @@
 [submodule "components/esp-camera-pipeline"]
 	path = components/esp-camera-pipeline
-	url = git@gitlab.com:kdmukAI-bot/esp-camera-pipeline.git
+	url = https://github.com/kdmukAI-bot/esp-camera-pipeline.git
