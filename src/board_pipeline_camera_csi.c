@@ -31,6 +31,7 @@
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 static const char *TAG = "pipeline_cam_csi";
 
@@ -65,6 +66,7 @@ typedef struct {
     cam_pipeline_frame_cb_t frame_cb;
     void *user_ctx;
     TaskHandle_t task_handle;
+    SemaphoreHandle_t task_done_sem;  /* task gives it on exit; stop() joins on it */
     volatile bool running;
 } csi_driver_ctx_t;
 
@@ -108,6 +110,13 @@ static void csi_capture_task(void *param)
     }
 
     ESP_LOGI(TAG, "Capture task exiting");
+    /* Signal csi_stop that we've left the loop and are self-deleting. csi_stop
+     * joins on this BEFORE calling STREAMOFF, so we always exit here off a real
+     * frame (DQBUF returns while streaming is still on) instead of being left
+     * blocked in DQBUF -- see the note in csi_stop. */
+    if (ctx->task_done_sem) {
+        xSemaphoreGive(ctx->task_done_sem);
+    }
     vTaskDelete(NULL);
 }
 
@@ -245,12 +254,26 @@ static esp_err_t csi_start(void *handle, cam_pipeline_frame_cb_t frame_cb,
         return ESP_FAIL;
     }
 
+    /* Done-semaphore so csi_stop can join the capture task before STREAMOFF
+     * (see csi_stop). Created before the task so the task can always give it. */
+    ctx->task_done_sem = xSemaphoreCreateBinary();
+    if (!ctx->task_done_sem) {
+        ESP_LOGE(TAG, "Failed to create capture task done semaphore");
+        ctx->running = false;
+        ioctl(ctx->video_fd, VIDIOC_STREAMOFF, &type);
+        return ESP_FAIL;
+    }
+
     /* Spawn capture task */
     BaseType_t ret = xTaskCreatePinnedToCore(
         csi_capture_task, "csi_cap", CSI_TASK_STACK, ctx,
         CSI_TASK_PRIORITY, &ctx->task_handle, core_id);
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create capture task");
+        vSemaphoreDelete(ctx->task_done_sem);
+        ctx->task_done_sem = NULL;
+        ctx->running = false;
+        ioctl(ctx->video_fd, VIDIOC_STREAMOFF, &type);
         return ESP_FAIL;
     }
 
@@ -266,17 +289,43 @@ static esp_err_t csi_start(void *handle, cam_pipeline_frame_cb_t frame_cb,
 static esp_err_t csi_stop(void *handle)
 {
     csi_driver_ctx_t *ctx = (csi_driver_ctx_t *)handle;
+
+    /* Join the capture task BEFORE stopping the stream.
+     *
+     * The task blocks in VIDIOC_DQBUF, which esp_video waits on with a hardcoded
+     * portMAX_DELAY and NEVER signals on stop -- VIDIOC_STREAMOFF actually
+     * *deletes* the semaphore DQBUF is waiting on. So a task still parked in
+     * DQBUF when we STREAMOFF is stranded forever, and it can't even be safely
+     * vTaskDelete'd afterward (its event-list item points into the freed
+     * semaphore, so removing it would corrupt the heap). Every scan cycle used to
+     * orphan one such task, leaking its CSI_TASK_STACK (~16 KB internal RAM) until
+     * a later cycle could no longer allocate a task stack and start() failed.
+     *
+     * Instead, clear `running` and wait for the task to exit on its own while the
+     * stream is STILL ON. Frames keep arriving, so DQBUF returns within ~one frame
+     * period, the loop sees running==false, gives task_done_sem, and self-deletes
+     * cleanly. Only then do we STREAMOFF -- no task is parked in DQBUF, so esp_video
+     * deleting the semaphore is harmless. */
     ctx->running = false;
 
-    /* Stop V4L2 streaming — this unblocks VIDIOC_DQBUF */
+    if (ctx->task_handle) {
+        if (ctx->task_done_sem &&
+            xSemaphoreTake(ctx->task_done_sem, pdMS_TO_TICKS(500)) != pdTRUE) {
+            /* Only reached if frames stopped arriving (camera stall) so DQBUF
+             * never returned. Rare degraded case -- leave the task rather than
+             * risk a heap-corrupting delete; it is not the per-cycle leak. */
+            ESP_LOGW(TAG, "Capture task did not exit before STREAMOFF");
+        }
+        ctx->task_handle = NULL;
+    }
+
+    /* Stop V4L2 streaming (safe now: no task is blocked in DQBUF). */
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     ioctl(ctx->video_fd, VIDIOC_STREAMOFF, &type);
 
-    /* Wait for capture task to exit */
-    if (ctx->task_handle) {
-        /* Give the task time to notice and exit */
-        vTaskDelay(pdMS_TO_TICKS(100));
-        ctx->task_handle = NULL;
+    if (ctx->task_done_sem) {
+        vSemaphoreDelete(ctx->task_done_sem);
+        ctx->task_done_sem = NULL;
     }
 
     ESP_LOGI(TAG, "Streaming stopped");
