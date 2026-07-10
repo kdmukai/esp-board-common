@@ -122,3 +122,11 @@
 #ifndef BOARD_HAS_IMU
 #define BOARD_HAS_IMU               0
 #endif
+
+/* ── Radio co-processor (ESP32-C6 "WIFI6", SDIO slave) ── */
+/* The C6 follows the esp-hosted P4 reference wiring: its reset line idles
+ * high (chip runs its factory hosted-slave firmware) and GPIO54 is the
+ * esp-hosted default SDIO reset-slave pin (low = held in reset). SeedSigner
+ * never uses the radio, so board_init() drives this low at boot and leaves
+ * it low — the C6 executes no code for the entire session (air gap). */
+#define BOARD_RADIO_COPROC_RESET_PIN GPIO_NUM_54
