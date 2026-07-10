@@ -483,16 +483,27 @@ static void lvgl_port_setup(const board_app_config_t *app_cfg,
     *disp_out = lvgl_port_add_disp(&disp_cfg);
 
 #else
-    /* Standard SPI boards (ST7796, ST7789): partial updates with PSRAM. */
+    /* Standard SPI boards (ST7796, ST7789): partial updates with small
+     * INTERNAL DMA draw buffers (not PSRAM).
+     *
+     * The GPSPI DMA cannot read PSRAM directly (on the P4 only AXI GDMA
+     * reaches external memory; GPSPI is served by AHB GDMA). With a PSRAM
+     * draw buffer, spi_master bounces EVERY flush through a freshly-malloc'd
+     * internal buffer of the full transfer size (~150 KB for a half-screen
+     * flush) — and errors out when that allocation fails. Observed on the
+     * P4 LCD 3.5: the very first LVGL flush died with `spi transmit (queue)
+     * color failed` and the panel never received a pixel. Small internal
+     * double buffers keep every flush DMA-direct — same approach as the
+     * camera preview stripe buffer in board_pipeline_display_lvgl.c. */
     lvgl_port_display_cfg_t disp_cfg = {
         .io_handle     = io_handle,
         .panel_handle  = panel_handle,
         .hres          = lvgl_hres,
         .vres          = lvgl_vres,
-        .buffer_size   = (uint32_t)lvgl_hres * (lvgl_vres / 2) * sizeof(lv_color16_t),
+        .buffer_size   = (uint32_t)lvgl_hres * (lvgl_vres / 8) * sizeof(lv_color16_t),
         .double_buffer = true,
         .flags = {
-            .buff_spiram = 1,
+            .buff_dma    = 1,
             .swap_bytes  = 1,
         },
     };
@@ -502,9 +513,20 @@ static void lvgl_port_setup(const board_app_config_t *app_cfg,
 
     /* ── Panel MADCTL for standard SPI boards ── */
 #if BOARD_DISPLAY_DRIVER != DISPLAY_ST7701 && !BOARD_DISPLAY_QUIRK_RASET_BUG
+    /* Landscape mirror axes are per-board: the swap_xy+mirror pair selects one
+     * of the two 180°-apart landscape orientations, and which one is "up"
+     * depends on the panel's native scan direction. Boards where the default
+     * renders upside down override these in board_config.h (both axes must be
+     * toggled together to stay a pure rotation). */
+#ifndef BOARD_LANDSCAPE_MIRROR_X
+#define BOARD_LANDSCAPE_MIRROR_X 1
+#endif
+#ifndef BOARD_LANDSCAPE_MIRROR_Y
+#define BOARD_LANDSCAPE_MIRROR_Y 1
+#endif
     if (landscape) {
         esp_lcd_panel_swap_xy(panel_handle, true);
-        esp_lcd_panel_mirror(panel_handle, true, true);
+        esp_lcd_panel_mirror(panel_handle, BOARD_LANDSCAPE_MIRROR_X, BOARD_LANDSCAPE_MIRROR_Y);
     } else {
 #if defined(BOARD_DISPLAY_MIRROR_X) && BOARD_DISPLAY_MIRROR_X
         esp_lcd_panel_mirror(panel_handle, true, false);

@@ -34,6 +34,12 @@
 #define BOARD_DISPLAY_DIRECT_MODE       0
 #define BOARD_DISPLAY_INVERT_COLOR      0
 #define BOARD_DISPLAY_MIRROR_X          1   /* Panel is mirrored horizontally by default */
+/* Landscape orientation: the generic default (swap_xy + mirror(1,1) in
+ * board_init.c) is the canonical one — it matches the FT6336 landscape touch
+ * transform. There is no "right way up" in hardware; if it reads upside down
+ * on a stand, flip the device. (A 180° display flip via the
+ * BOARD_LANDSCAPE_MIRROR_X/Y overrides was tried 2026-07-10 and made touch
+ * disagree with the panel — don't flip one without the other.) */
 
 /* ── IO Expander ── */
 #define BOARD_HAS_IO_EXPANDER   0
@@ -53,8 +59,12 @@
 #define BOARD_PMIC_DRIVER       PMIC_AXP2101
 
 /* ── LVGL port tuning ── */
-#define BOARD_LVGL_TASK_PRIORITY    5
-#define BOARD_LVGL_TASK_STACK       (1024 * 12)
+/* Flattened to 1 (== MicroPython VM task) so LVGL-lock access is FIFO-fair and the
+ * prio-1 VM/consumer doesn't starve at overlay-create / present(). A/B-confirmed not
+ * to affect preview fps on the P4 LCD 4.3 (prio-5 firmware measured the same);
+ * ported here with the same rationale. See board_common note. */
+#define BOARD_LVGL_TASK_PRIORITY    1
+#define BOARD_LVGL_TASK_STACK       (1024 * 16)
 #define BOARD_LVGL_TASK_AFFINITY    -1  /* No core affinity */
 #define BOARD_LVGL_MAX_SLEEP_MS     500
 #define BOARD_LVGL_TIMER_PERIOD_MS  5
@@ -98,3 +108,12 @@
 #ifndef BOARD_HAS_IMU
 #define BOARD_HAS_IMU               0
 #endif
+
+/* ── Radio co-processor (ESP32-C6 "WIFI6", SDIO slave) ── */
+/* Verified from the board schematic (ESP32-P4-WIFI6-Touch-LCD-3.5-schematic.pdf):
+ * P4 GPIO54 → R54 (0R) → C6_CHIP_PU — same esp-hosted P4 reference wiring as
+ * the LCD 4.3 board. The C6's reset line idles high (chip runs its factory
+ * hosted-slave firmware); driving it low holds the C6 in reset. SeedSigner
+ * never uses the radio, so board_init() drives this low at boot and leaves
+ * it low — the C6 executes no code for the entire session (air gap). */
+#define BOARD_RADIO_COPROC_RESET_PIN GPIO_NUM_54
