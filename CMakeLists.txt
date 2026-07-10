@@ -33,7 +33,7 @@ set(SRC_FILES
 # CSI (esp_driver_cam + esp_cam_sensor) for P4.
 set(REQUIRED_COMPONENTS
     "esp_lcd" "driver" "esp_adc" "espressif__esp_lvgl_port" "lvgl"
-    "espressif__esp_lcd_axs15231b" "espressif__esp_io_expander_tca9554"
+    "espressif__esp_lcd_axs15231b"
     "espressif__esp_lcd_st7796"
     "espressif__esp_lcd_touch_ft5x06" "espressif__esp_lcd_touch_cst816s"
     "espressif__esp_lcd_touch_gt911"
@@ -43,6 +43,39 @@ set(REQUIRED_COMPONENTS
     "waveshare__pcf85063a" "waveshare__qmi8658"
     "esp-camera-pipeline" "cam_pipeline_qr"
 )
+
+# I/O expander (TCA9554): required only when the selected board actually has
+# one (BOARD_HAS_IO_EXPANDER 1 in its board_config.h — e.g. the S3 LCD 3.5B,
+# which routes display reset through it). All expander use in the sources is
+# #if BOARD_HAS_IO_EXPANDER-guarded, so a board that defines it 0 can drop
+# the component from the build entirely (a consumer project may additionally
+# EXCLUDE_COMPONENTS it — see seedsigner-micropython-builder). To re-enable
+# for a future board: set BOARD_HAS_IO_EXPANDER 1 (+ BOARD_IO_EXPANDER_ADDR /
+# _RST_PIN) in that board's board_config.h — nothing else.
+#
+# The env fallback matters: ESP-IDF evaluates this file an extra time in
+# script mode (early REQUIRES collection), where -D cache variables like
+# BOARD_CONFIG_DIR don't exist. The builder exports BOARD_CONFIG_DIR into the
+# environment so both passes agree; if neither is visible we conservatively
+# keep the component (it costs nothing when unused — dead-stripped).
+set(_bc_cfg_dir "${BOARD_CONFIG_DIR}")
+if(NOT _bc_cfg_dir AND DEFINED ENV{BOARD_CONFIG_DIR})
+    set(_bc_cfg_dir "$ENV{BOARD_CONFIG_DIR}")
+endif()
+if(NOT _bc_cfg_dir AND DEFINED BOARD AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD}")
+    set(_bc_cfg_dir "${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD}")
+endif()
+set(_bc_has_io_expander 1)
+if(_bc_cfg_dir AND EXISTS "${_bc_cfg_dir}/board_config.h")
+    file(STRINGS "${_bc_cfg_dir}/board_config.h" _bc_ioexp_off
+         REGEX "#define[ \t]+BOARD_HAS_IO_EXPANDER[ \t]+0")
+    if(_bc_ioexp_off)
+        set(_bc_has_io_expander 0)
+    endif()
+endif()
+if(_bc_has_io_expander)
+    list(APPEND REQUIRED_COMPONENTS "espressif__esp_io_expander_tca9554")
+endif()
 
 # MIPI-DSI display (ESP32-P4): ST7701 + LDO regulator
 if(IDF_TARGET STREQUAL "esp32p4")

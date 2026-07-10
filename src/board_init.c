@@ -16,6 +16,7 @@
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "driver/gpio.h"
 
 #include "board.h"
 #include "board_config.h"
@@ -544,6 +545,30 @@ int board_init(const board_app_config_t *app_cfg,
     ESP_LOGI(TAG, "Initializing %s...", BOARD_NAME);
 
     bool landscape = app_cfg && app_cfg->landscape;
+
+    /* Step 0: Radio co-processor hold-in-reset (air gap).
+     * Boards with an external radio co-processor (e.g. the ESP32-C6 behind
+     * SDIO on the P4 "WIFI6" boards) define BOARD_RADIO_COPROC_RESET_PIN in
+     * board_config.h. The firmware never talks to that chip; driving its
+     * reset line low here — the earliest point of board bring-up — and
+     * LEAVING it low holds the co-processor in reset for the whole session:
+     * it executes no code and radiates nothing. This is the same line
+     * esp-hosted would pulse to reset its slave (idles high; low = reset
+     * asserted). The pull-down keeps the line biased low even if the pin
+     * config is later reset. */
+#ifdef BOARD_RADIO_COPROC_RESET_PIN
+    gpio_config_t coproc_rst_cfg = {
+        .pin_bit_mask = 1ULL << BOARD_RADIO_COPROC_RESET_PIN,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&coproc_rst_cfg);
+    gpio_set_level(BOARD_RADIO_COPROC_RESET_PIN, 0);
+    ESP_LOGI(TAG, "Radio co-processor held in reset (GPIO%d low)",
+             (int)BOARD_RADIO_COPROC_RESET_PIN);
+#endif
 
     /* Step 1: I2C bus */
     i2c_master_bus_handle_t i2c_bus = board_i2c_init(

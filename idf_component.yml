@@ -1,6 +1,12 @@
 dependencies:
   espressif/esp_lcd_axs15231b: "2.1.0"
-  espressif/esp_io_expander_tca9554: "2.0.3"
+  # I/O expander: fetched but NOT auto-injected as a requirement (require: no).
+  # The component manager would otherwise force it into board_common's
+  # requirements on every board; instead CMakeLists.txt REQUIREs it only when
+  # the selected board's config sets BOARD_HAS_IO_EXPANDER 1 (see there).
+  espressif/esp_io_expander_tca9554:
+    version: "2.0.3"
+    require: no
   espressif/esp_lcd_st7796: "1.4.0"
   espressif/esp_lcd_touch_ft5x06: "1.1.0"
   espressif/esp_lcd_touch_cst816s: "1.1.0"
