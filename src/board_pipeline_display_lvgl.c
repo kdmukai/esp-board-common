@@ -33,6 +33,20 @@ static const char *TAG = "pipeline_disp_lvgl";
 #define DMA_STRIPE_LINES_MIN      10
 #define DMA_BUF_ALIGN             64   /* safe for SPI DMA on all targets */
 
+/* GPSPI sends each esp_lcd_panel_draw_bitmap in chunks capped at the bus's max
+ * single transaction = MIN(max_transfer_sz, SPI_MS_DATA_BITLEN/8). On the ESP32-P4
+ * and ESP32-S3 that length register is 18 bits → 0x3FFFF/8 = 32767 bytes, an ODD
+ * value. A stripe larger than this is split by esp_lcd at byte offset 32767, which
+ * is NOT cache-line aligned, so the SPI master (setup_priv_desc) allocates a fresh
+ * ~32 KB bounce buffer from the DMA-capable internal heap on EVERY blit. Over a
+ * long camera scan the DMA pool fragments below 32 KB, that alloc fails with
+ * ESP_ERR_NO_MEM, and the panel freezes. Capping each stripe to a single
+ * sub-limit chunk (and row_bytes = width*2 is a multiple of 64 for the 320-wide
+ * camera square, so the transfer length stays 64-aligned) keeps the blit
+ * zero-copy: no per-blit bounce, no DMA-pool churn/fragmentation, and it avoids
+ * the bounce memcpy entirely. */
+#define SPI_MAX_SINGLE_XFER_BYTES 32767u
+
 typedef struct {
     /* Common */
     lv_obj_t *container;
@@ -44,6 +58,7 @@ typedef struct {
 
     /* Dummy-draw mode */
     bool dummy_draw;
+    bool keep_lvgl_running;   /* partition mode: LVGL keeps rendering the gutters */
     bool byte_swap;
     lv_display_t *disp;
     uint8_t *dma_buf;
@@ -87,7 +102,13 @@ static bool push_frame_dummy_draw(lvgl_display_ctx_t *ctx,
     const uint8_t *src_fb = rgb565_buf;
     uint32_t row = 0;
     uint32_t x = ctx->x_offset;
+    bool ok = true;
 
+    /* Partition mode is now single-writer: LVGL's flush is redirected into a
+     * shadow FB (board_init.c) so it touches no SPI, and THIS task is the only
+     * SPI writer. No LVGL port lock is taken — there is nothing to serialize
+     * against on the bus. (Legacy dummy-draw with LVGL stopped is also
+     * sole-writer.) */
     while (row < height) {
         uint32_t block = height - row;
         if (block > ctx->dma_stripe_lines)
@@ -97,15 +118,29 @@ static bool push_frame_dummy_draw(lvgl_display_ctx_t *ctx,
         copy_swap_u16((uint16_t *)ctx->dma_buf, src, (size_t)width * block);
 
         uint32_t y = ctx->y_offset + row;
-        esp_err_t ret = esp_lcd_panel_draw_bitmap(
-            panel, x, y, x + width, y + block, ctx->dma_buf);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "draw_bitmap failed: %s", esp_err_to_name(ret));
-            return false;
+        if (ctx->keep_lvgl_running) {
+            /* Partition mode: synchronous blit (wait for DMA) so the next stripe
+             * can reuse ctx->dma_buf — draw_bitmap is async (queue depth 10). */
+            board_display_partition_blit(x, y, x + width, y + block, ctx->dma_buf);
+        } else {
+            esp_err_t ret = esp_lcd_panel_draw_bitmap(
+                panel, x, y, x + width, y + block, ctx->dma_buf);
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "draw_bitmap failed: %s", esp_err_to_name(ret));
+                ok = false;
+                break;
+            }
         }
         row += block;
     }
-    return true;
+
+    /* Blit the live gutter chrome LVGL rendered into the shadow FB (same task =
+     * sole writer). Runs every frame; cheap (two 80px columns, banded DMA).
+     * No-op stub on non-partition boards; guarded by keep_lvgl_running anyway. */
+    if (ctx->keep_lvgl_running) {
+        board_display_partition_blit_gutters();
+    }
+    return ok;
 }
 
 /* ── Image widget push: standard LVGL rendering ── */
@@ -172,6 +207,7 @@ static void *lvgl_display_init(void *parent, uint32_t width, uint32_t height,
     ctx->width = width;
     ctx->height = height;
     ctx->dummy_draw = use_dummy_draw;
+    ctx->keep_lvgl_running = cfg ? cfg->keep_lvgl_running : false;
     ctx->byte_swap = cfg ? cfg->byte_swap : false;
     ctx->overlay_cb = cfg ? cfg->overlay_cb : NULL;
     ctx->overlay_cb_ctx = cfg ? cfg->overlay_cb_ctx : NULL;
@@ -229,6 +265,13 @@ static void *lvgl_display_init(void *parent, uint32_t width, uint32_t height,
         if (ctx->byte_swap) {
             /* SPI panels need an internal-RAM DMA buffer for byte-swap + striped blit */
             ctx->dma_stripe_lines = DMA_STRIPE_LINES_DEFAULT;
+            /* Cap so each stripe fits in ONE aligned SPI transaction — otherwise
+             * esp_lcd splits at the odd 32767-byte limit and the SPI master
+             * bounce-allocates per blit, fragmenting the DMA heap → freeze. */
+            uint32_t max_single_chunk_lines = SPI_MAX_SINGLE_XFER_BYTES / (width * 2);
+            if (max_single_chunk_lines < 1) max_single_chunk_lines = 1;
+            if (ctx->dma_stripe_lines > max_single_chunk_lines)
+                ctx->dma_stripe_lines = max_single_chunk_lines;
             while (ctx->dma_stripe_lines >= DMA_STRIPE_LINES_MIN) {
                 size_t stripe_size = width * ctx->dma_stripe_lines * 2;
                 ctx->dma_buf = heap_caps_aligned_alloc(
@@ -263,9 +306,31 @@ static void *lvgl_display_init(void *parent, uint32_t width, uint32_t height,
             ctx->y_offset = (ctx->panel_height > height)
                           ? (ctx->panel_height - height) / 2 : 0;
 
+            /* Declared before the partition goto so the jump never skips an
+             * initializer (kept ESP_OK / unused on the partition path). */
+            esp_err_t ret = ESP_OK;
+
+            if (ctx->keep_lvgl_running) {
+                /* ── Partition mode (single-writer compositing) ──────────────
+                 * LVGL keeps running and owns the gutters (touch stays live),
+                 * but its flush is redirected into a shadow framebuffer — it
+                 * issues NO SPI transactions. The camera consumer is the SOLE
+                 * SPI writer: it blits the square AND the gutter columns (from
+                 * the shadow FB). That is what structurally removes the
+                 * two-writer ST7796 bus collision. begin() reserves the square,
+                 * allocates the shadow FB + gutter DMA band, and paints the
+                 * panel black once. (No-op stub on non-partition boards.) */
+                if (board_display_partition_begin(
+                        ctx->panel_width, ctx->panel_height,
+                        ctx->x_offset, ctx->y_offset, width, height) != ESP_OK) {
+                    ESP_LOGE(TAG, "partition begin failed — camera preview degraded");
+                }
+                goto dummy_draw_done;
+            }
+
             /* Enable dummy-draw mode — stop LVGL rendering so camera
              * frames can be sent directly to the panel. */
-            esp_err_t ret = lvgl_port_stop();
+            ret = lvgl_port_stop();
             if (ret != ESP_OK) {
                 ESP_LOGE(TAG, "Failed to stop LVGL port: %s", esp_err_to_name(ret));
                 ctx->dummy_draw = false;
@@ -305,6 +370,7 @@ static void *lvgl_display_init(void *parent, uint32_t width, uint32_t height,
                 ESP_LOGI(TAG, "Display cleared to black (x_offset=%"PRIu32", y_offset=%"PRIu32")",
                          ctx->x_offset, ctx->y_offset);
             }
+        dummy_draw_done: ;
         }
     }
 
@@ -337,9 +403,16 @@ static void lvgl_display_deinit(void *handle)
     lvgl_display_ctx_t *ctx = (lvgl_display_ctx_t *)handle;
     if (!ctx) return;
 
-    /* Resume LVGL rendering if dummy-draw was active */
+    /* Partition mode never stopped LVGL — end the single-writer session: drop
+     * the flush redirect + reserved rect, free the shadow FB, and repaint the
+     * screen (LVGL owns the panel again). Legacy dummy-draw resumes the LVGL
+     * port it stopped. */
     if (ctx->dummy_draw) {
-        lvgl_port_resume();
+        if (ctx->keep_lvgl_running) {
+            board_display_partition_end();  /* no-op stub on non-partition boards */
+        } else {
+            lvgl_port_resume();
+        }
     }
 
     if (lvgl_port_lock(1000)) {

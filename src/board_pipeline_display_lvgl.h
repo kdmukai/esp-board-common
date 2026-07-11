@@ -27,6 +27,11 @@ typedef void (*pipeline_overlay_cb_t)(uint8_t *frame_buf, uint32_t width,
 typedef struct {
     bool use_dummy_draw;    /**< true = bypass LVGL, direct stripe blit to panel */
     bool byte_swap;         /**< true = swap RGB565 bytes (SPI panels only) */
+    bool keep_lvgl_running; /**< partition mode (dummy-draw only): do NOT stop LVGL.
+                                 The camera direct-blits its centered square under the
+                                 LVGL port lock while LVGL keeps rendering the gutter
+                                 chrome (with live touch); a reserved-rect flush guard
+                                 fences LVGL off the square. SPI panels only. */
     pipeline_overlay_cb_t overlay_cb;   /**< per-frame overlay compositing callback */
     void *overlay_cb_ctx;               /**< user context passed to overlay_cb */
 } board_pipeline_lvgl_display_config_t;

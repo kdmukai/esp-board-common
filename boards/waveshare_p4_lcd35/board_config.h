@@ -74,6 +74,21 @@
 #define BOARD_HAS_CAMERA            1
 #endif
 #define BOARD_CAMERA_INTERFACE      CAMERA_CSI
+
+/* Camera preview rendering: partition mode. Unlike the S3 dummy-draw path
+ * (which stops LVGL, killing overlay rendering AND touch), keep LVGL running so
+ * live chrome renders in the side gutters — with working touch — beside the
+ * camera square, which is direct-blitted under the shared LVGL port lock.
+ * ST7796 SPI, single-buffered; see board_pipeline_display_lvgl.c. */
+#define BOARD_CAMERA_PARTITION_MODE 1
+
+/* The OV5647 module is physically mounted ~90° rotated relative to the panel on
+ * this board — a fixed mount offset, independent of how the device is held.
+ * Correct it in the camera PPA SRM pass (free; square-in/square-out; decode is
+ * rotation-invariant so the QR consumer is unaffected). The PPA rotates
+ * counter-clockwise, so 270° CCW == the required 90° CW correction. Pinned on
+ * device 2026-07-10; flip 270<->90 if the preview lands mirrored/upside down. */
+#define BOARD_CAMERA_ROTATION       270
 #define BOARD_PIN_CAM_SCCB_SDA      GPIO_NUM_7
 #define BOARD_PIN_CAM_SCCB_SCL      GPIO_NUM_8
 #define BOARD_CAM_SCCB_I2C_PORT     0   /* Shares main I2C bus */
