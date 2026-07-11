@@ -12,6 +12,9 @@ CONFIG_COMPILER_OPTIMIZATION_PERF=y
 # blocked by flash cache misses. Without this, display DMA from SPIRAM fails.
 CONFIG_SPI_MASTER_ISR_IN_IRAM=y
 
+# FreeRTOS tick rate (needed for smooth LVGL rendering; matches P4 LCD 4.3)
+CONFIG_FREERTOS_HZ=1000
+
 # Disable power management: PM clock gating can scale down APB clock and
 # gate SPI peripheral clocks, causing display transactions to fail.
 CONFIG_PM_ENABLE=n

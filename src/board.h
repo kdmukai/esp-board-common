@@ -93,6 +93,47 @@ void board_run(void);
  */
 void board_set_render_interval_ms(uint32_t interval_ms);
 
+/**
+ * Reserve a rectangle that LVGL must NOT flush into (partition mode).
+ *
+ * While a rect is set, the standard-SPI display's LV_EVENT_INVALIDATE_AREA
+ * guard clips LVGL invalidations out of this rectangle so a concurrent writer
+ * (the camera preview direct-blitting the centered square) owns it exclusively.
+ * Coordinates are in LVGL logical pixels. The rect is assumed to be a
+ * full-height, horizontally-centered band with chrome living in the left/right
+ * gutters (the P4-35 camera-preview layout).
+ *
+ * Belt-and-suspenders: discipline (keeping chrome widgets in the gutters) is
+ * the primary guarantee; this only prevents flicker from stray invalidations.
+ * No-op on boards whose display path never registers the guard (ST7701/DSI,
+ * RASET). Safe to call from any task while holding the LVGL port lock.
+ */
+void board_display_set_reserved_rect(int32_t x, int32_t y, int32_t w, int32_t h);
+
+/** Clear the reserved rectangle set by board_display_set_reserved_rect(). */
+void board_display_clear_reserved_rect(void);
+
+/* ── Single-writer partition compositing (ST7796 camera preview) ──────────────
+ * During a camera session on a partition-mode board, LVGL's flush is redirected
+ * into an off-screen shadow framebuffer (it issues NO SPI transactions) and the
+ * camera consumer becomes the sole SPI writer: it blits its square AND the gutter
+ * columns (from the shadow FB) itself. This removes the two-writer bus collision.
+ * begin/end bracket the session; blit_gutters() runs each camera frame. All three
+ * are no-ops / absent on boards that don't define BOARD_CAMERA_PARTITION_MODE.
+ * MUST be called from the camera consumer task (the sole writer). Declared
+ * unconditionally (definitions + call sites are gated on BOARD_CAMERA_PARTITION_MODE
+ * so only that board links them). */
+esp_err_t board_display_partition_begin(int32_t disp_w, int32_t disp_h,
+                                        int32_t sq_x, int32_t sq_y,
+                                        int32_t sq_w, int32_t sq_h);
+void board_display_partition_end(void);
+void board_display_partition_blit_gutters(void);
+/* Synchronous panel blit (draw_bitmap + wait for DMA completion) — lets the camera
+ * consumer reuse its source buffer immediately. Ends are exclusive, like
+ * esp_lcd_panel_draw_bitmap. No-op stub on non-partition boards. */
+void board_display_partition_blit(int32_t x_start, int32_t y_start,
+                                  int32_t x_end, int32_t y_end, const void *buf);
+
 /** Get LCD panel handle (for diagnostic/testing that bypasses LVGL). */
 esp_lcd_panel_handle_t board_get_panel_handle(void);
 

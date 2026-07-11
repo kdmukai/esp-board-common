@@ -16,6 +16,14 @@
 #define BOARD_CAMERA_ROTATION 0
 #endif
 
+/* Partition mode: keep LVGL running during the camera preview so live chrome
+ * renders in the gutters beside the direct-blit square (SPI/dummy-draw boards
+ * only). Opt-in per board — the S3 dummy-draw boards stay on the proven
+ * LVGL-stopped path until validated. */
+#ifndef BOARD_CAMERA_PARTITION_MODE
+#define BOARD_CAMERA_PARTITION_MODE 0
+#endif
+
 #if BOARD_CAMERA_INTERFACE == CAMERA_DVP
 #include "board_pipeline_camera_dvp.h"
 #include "driver/ledc.h"
@@ -37,14 +45,19 @@ cam_pipeline_config_t board_pipeline_default_config(void *display_parent,
 #if BOARD_DISPLAY_DRIVER == DISPLAY_ST7701
     s_lvgl_display_config.use_dummy_draw = false;
     s_lvgl_display_config.byte_swap = false;
+    s_lvgl_display_config.keep_lvgl_running = false;
 #else
     s_lvgl_display_config.use_dummy_draw = true;
     s_lvgl_display_config.byte_swap = true;
+    s_lvgl_display_config.keep_lvgl_running = BOARD_CAMERA_PARTITION_MODE;
 #endif
 
-    /* DSI landscape: the flush callback rotates the entire LVGL canvas
-     * 90° CCW to the portrait panel.  Pre-rotate the camera frame 90° CW
-     * so the net camera orientation matches portrait mode. */
+    /* Camera pre-rotation into the single PPA SRM pass (crop+scale+rotate).
+     * DSI landscape (ST7701): the display flush rotates the whole LVGL canvas
+     *   90° CCW to the portrait panel, so pre-rotate the camera 90° CW to match.
+     * SPI/MADCTL landscape boards: the rotation is a fixed camera-to-panel
+     *   MOUNT offset, supplied per board as BOARD_CAMERA_ROTATION (PPA angle is
+     *   counter-clockwise; e.g. 270 == a 90° CW correction). */
 #if BOARD_LANDSCAPE && BOARD_DISPLAY_DRIVER == DISPLAY_ST7701
     int cam_rotation = (BOARD_CAMERA_ROTATION + 270) % 360;
 #else

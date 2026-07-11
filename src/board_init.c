@@ -76,6 +76,286 @@ static esp_lcd_touch_handle_t touch_handle = NULL;
 esp_lcd_panel_handle_t board_get_panel_handle(void) { return panel_handle; }
 esp_lcd_touch_handle_t board_get_touch_handle(void) { return touch_handle; }
 
+/* ── Partition-mode flush guard ──────────────────────────────────────────────
+ * Fences LVGL out of a reserved rectangle (the camera-preview square) so a
+ * direct-blit writer can own it while LVGL keeps rendering the surrounding
+ * gutters. See board_display_set_reserved_rect() in board.h. Registered only on
+ * the standard-SPI display path (the partition-capable panels). ── */
+
+/* The standard-SPI display path (partial-update, MADCTL) — the only one that
+ * partitions the panel and registers the invalidate-area guard below. */
+#if BOARD_DISPLAY_DRIVER != DISPLAY_ST7701 && !BOARD_DISPLAY_QUIRK_RASET_BUG
+#define BOARD_DISPLAY_STD_SPI 1
+#else
+#define BOARD_DISPLAY_STD_SPI 0
+#endif
+
+static lv_area_t s_reserved_rect;
+static bool      s_reserved_active = false;
+
+#if BOARD_DISPLAY_STD_SPI
+static void invalidate_area_guard_cb(lv_event_t *e)
+{
+    if (!s_reserved_active) return;
+    lv_area_t *a = (lv_area_t *)lv_event_get_param(e);
+    if (!a) return;
+
+    /* No overlap with the reserved band → leave the invalidation untouched. */
+    if (a->x2 < s_reserved_rect.x1 || a->x1 > s_reserved_rect.x2 ||
+        a->y2 < s_reserved_rect.y1 || a->y1 > s_reserved_rect.y2) {
+        return;
+    }
+
+    /* Overlaps the camera band. The band is full-height and horizontally
+     * centered, so legitimate chrome lives in the left (x < x1) or right
+     * (x > x2) gutter; clip the invalidation to the gutter slab it extends
+     * into. If it is wholly inside the band (a stray over-square invalidation),
+     * collapse it to a 1px no-op — the camera repaints that pixel next frame. */
+    if (a->x1 < s_reserved_rect.x1) {
+        a->x2 = s_reserved_rect.x1 - 1;   /* keep the left-gutter slab */
+    } else if (a->x2 > s_reserved_rect.x2) {
+        a->x1 = s_reserved_rect.x2 + 1;   /* keep the right-gutter slab */
+    } else {
+        a->x2 = a->x1;                    /* fully inside → 1px no-op */
+        a->y2 = a->y1;
+    }
+}
+
+#if BOARD_CAMERA_PARTITION_MODE
+/* ── Partition-mode custom flush (single-writer camera compositing) ───────────
+ * We take over LVGL's flush for this board so a camera session can redirect
+ * LVGL's gutter rendering OFF the SPI bus and into a shadow framebuffer — making
+ * the camera the SOLE SPI writer and structurally eliminating the two-writer bus
+ * collision that froze the ST7796 (LVGL flush + camera direct-blit racing on one
+ * panel IO). esp_lvgl_port's on_color_trans_done stays registered and calls
+ * lv_disp_flush_ready when the DMA lands, so here we only swap + blit.
+ *
+ *   - normal (no camera): identical to esp_lvgl_port's flush — swap + draw_bitmap.
+ *   - camera active (s_cam_flush_redirect): copy the rendered gutter pixels into
+ *     the shadow FB (byte-swapped, panel-ready) + mark the gutter dirty; the
+ *     camera consumer blits them. LVGL issues ZERO SPI transactions. (stage 2) */
+#define GUTTER_BAND_LINES 40
+static volatile bool s_cam_flush_redirect = false;
+static uint16_t *s_shadow_fb  = NULL;   /* full landscape frame, panel-ready (byte-swapped) */
+static uint16_t *s_gutter_dma = NULL;   /* internal-DMA band buffer for gutter blits */
+static int32_t   s_shadow_w = 0, s_shadow_h = 0;   /* shadow FB dims (LVGL/panel space) */
+static int32_t   s_sq_x1 = 0, s_sq_x2 = -1;        /* camera-square column span; gutters flank it */
+static int32_t   s_gutter_w = 0;                   /* wider of the two gutters (DMA band width) */
+static SemaphoreHandle_t s_shadow_mutex = NULL;    /* guards shadow FB: LVGL write vs camera read */
+static lv_display_t *s_std_disp = NULL;
+static SemaphoreHandle_t s_blit_sem = NULL;        /* signalled per draw_bitmap DMA completion */
+
+/* Our own on_color_trans_done for the ST7796 panel IO (replaces esp_lvgl_port's).
+ * Every draw_bitmap DMA completion: (1) signal s_blit_sem so a camera-path blit can
+ * wait before reusing its DMA buffer (trans_queue_depth=10 → draw_bitmap is async);
+ * (2) still call lv_display_flush_ready so normal LVGL rendering works unchanged. */
+static bool std_spi_blit_done_cb(esp_lcd_panel_io_handle_t io,
+                                 esp_lcd_panel_io_event_data_t *ed, void *ctx)
+{
+    (void)io; (void)ed; (void)ctx;
+    BaseType_t woken = pdFALSE;
+    if (s_blit_sem) xSemaphoreGiveFromISR(s_blit_sem, &woken);
+    /* Only ack a REAL LVGL panel flush. During a camera session LVGL's flush is
+     * redirected (it calls flush_ready itself, synchronously) and the camera does
+     * ~22 blits/frame — acking those here would be spurious flush_ready calls that
+     * corrupt LVGL's draw-buffer accounting, so the first full-screen render after
+     * the session over-queues the SPI bus → queue full. Gate on !redirect. */
+    if (!s_cam_flush_redirect && s_std_disp) lv_display_flush_ready(s_std_disp);
+    return woken == pdTRUE;
+}
+
+/* Synchronous panel blit for the camera path: draw_bitmap + WAIT for its DMA to
+ * finish, so the caller may safely reuse the source buffer immediately. Only the
+ * camera consumer (sole SPI writer) uses this during a session. */
+void board_display_partition_blit(int32_t x_start, int32_t y_start,
+                                  int32_t x_end, int32_t y_end, const void *buf)
+{
+    if (s_blit_sem) xSemaphoreTake(s_blit_sem, 0);   /* drop any stale completion */
+    esp_err_t bret = esp_lcd_panel_draw_bitmap(panel_handle, x_start, y_start, x_end, y_end, buf);
+    if (bret != ESP_OK) {
+        ESP_LOGE(TAG, "partition blit failed: %s %d,%d..%d,%d",
+                 esp_err_to_name(bret), (int)x_start, (int)y_start, (int)x_end, (int)y_end);
+    }
+    /* Wait for THIS blit's DMA to finish before the caller reuses `buf`. */
+    if (s_blit_sem) xSemaphoreTake(s_blit_sem, pdMS_TO_TICKS(100));
+}
+
+static void std_spi_partition_flush_cb(lv_display_t *disp,
+                                       const lv_area_t *area, uint8_t *px_map)
+{
+    int32_t w = area->x2 - area->x1 + 1;
+    int32_t h = area->y2 - area->y1 + 1;
+
+    if (s_cam_flush_redirect && s_shadow_fb) {
+        /* Camera session: copy the rendered gutter pixels into the shadow FB
+         * (byte-swapped → panel-ready) so the camera consumer blits them. LVGL
+         * issues ZERO SPI transactions here → the camera is the sole SPI writer. */
+        const uint16_t *src = (const uint16_t *)px_map;
+        if (s_shadow_mutex) xSemaphoreTake(s_shadow_mutex, portMAX_DELAY);
+        for (int32_t r = 0; r < h; r++) {
+            int32_t sy = area->y1 + r;
+            if (sy < 0 || sy >= s_shadow_h) continue;
+            uint16_t *drow = &s_shadow_fb[(size_t)sy * s_shadow_w];
+            const uint16_t *srow = &src[(size_t)r * w];
+            for (int32_t c = 0; c < w; c++) {
+                int32_t sx = area->x1 + c;
+                if (sx < 0 || sx >= s_shadow_w) continue;
+                uint16_t p = srow[c];
+                drow[sx] = (uint16_t)((p >> 8) | (p << 8));
+            }
+        }
+        if (s_shadow_mutex) xSemaphoreGive(s_shadow_mutex);
+        lv_display_flush_ready(disp);
+        return;
+    }
+
+    lv_draw_sw_rgb565_swap(px_map, (uint32_t)w * (uint32_t)h);
+    esp_err_t dret = esp_lcd_panel_draw_bitmap(panel_handle, area->x1, area->y1,
+                                               area->x2 + 1, area->y2 + 1, px_map);
+    if (dret != ESP_OK) {
+        ESP_LOGE(TAG, "flush failed: %s area=%d,%d..%d,%d",
+                 esp_err_to_name(dret), (int)area->x1, (int)area->y1,
+                 (int)area->x2, (int)area->y2);
+    }
+    /* flush_ready is signalled by esp_lvgl_port's on_color_trans_done callback. */
+}
+
+esp_err_t board_display_partition_begin(int32_t disp_w, int32_t disp_h,
+                                        int32_t sq_x, int32_t sq_y,
+                                        int32_t sq_w, int32_t sq_h)
+{
+    s_shadow_w = disp_w;  s_shadow_h = disp_h;
+    s_sq_x1 = sq_x;       s_sq_x2 = sq_x + sq_w - 1;
+    if (!s_shadow_mutex) s_shadow_mutex = xSemaphoreCreateMutex();
+    if (!s_shadow_fb) {
+        s_shadow_fb = heap_caps_calloc(1, (size_t)disp_w * disp_h * 2, MALLOC_CAP_SPIRAM);
+        if (!s_shadow_fb) {
+            ESP_LOGE(TAG, "shadow FB alloc failed (%d B; SPIRAM free=%u)",
+                     (int)((size_t)disp_w * disp_h * 2),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    /* Gutter DMA band buffer sized to the GUTTER width (not the full panel) so it
+     * fits the squeezed internal heap during a camera session. */
+    int32_t gw_l = sq_x, gw_r = disp_w - (sq_x + sq_w);
+    s_gutter_w = (gw_l > gw_r) ? gw_l : gw_r;
+    if (s_gutter_w < 1) s_gutter_w = 1;
+    if (!s_gutter_dma) {
+        /* 64-byte aligned so the gutter blit is zero-copy too: an unaligned DMA
+         * source makes the SPI master bounce-allocate per blit, churning the
+         * DMA-capable heap (see the stripe-cap note in the pipeline). */
+        s_gutter_dma = heap_caps_aligned_alloc(64,
+                                        (size_t)s_gutter_w * GUTTER_BAND_LINES * 2,
+                                        MALLOC_CAP_DMA);
+        if (!s_gutter_dma) {
+            ESP_LOGE(TAG, "gutter DMA alloc failed (%d B; INTERNAL free=%u largest=%u)",
+                     (int)((size_t)s_gutter_w * GUTTER_BAND_LINES * 2),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+            heap_caps_free(s_shadow_fb); s_shadow_fb = NULL;
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    if (s_blit_sem) xSemaphoreTake(s_blit_sem, 0);   /* start clean (drop stale completion) */
+    /* Clip LVGL to the gutters and redirect its flush to the shadow FB. The shadow
+     * FB is zeroed (black), so the first gutter blit paints black until LVGL renders
+     * the chrome; the camera paints the square on its first frame. */
+    board_display_set_reserved_rect(sq_x, sq_y, sq_w, sq_h);
+    s_cam_flush_redirect = true;
+    /* Kick LVGL to render the current overlay screen into the shadow FB. */
+    if (s_std_disp && lvgl_port_lock(100)) {
+        lv_obj_invalidate(lv_screen_active());
+        lvgl_port_unlock();
+    }
+    ESP_LOGI(TAG, "Partition single-writer begin: %"PRId32"x%"PRId32
+             " square cols %"PRId32"..%"PRId32, disp_w, disp_h, s_sq_x1, s_sq_x2);
+    return ESP_OK;
+}
+
+void board_display_partition_end(void)
+{
+    /* Stop redirecting first, so LVGL's flush returns to the panel path. Do NOT
+     * trigger an LVGL repaint here: the camera consumer may still be finishing
+     * its last synchronous blit, and issuing an LVGL panel flush now would race
+     * it (two writers again → the teardown SPI error). The app repaints on its
+     * next screen, and lvgl_display_deinit's container delete repaints too — both
+     * after the consumer has stopped. Take the shadow mutex so no flush is
+     * mid-copy into the buffers we free. */
+    s_cam_flush_redirect = false;
+    board_display_clear_reserved_rect();
+    if (s_shadow_mutex) xSemaphoreTake(s_shadow_mutex, portMAX_DELAY);
+    if (s_shadow_fb)  { heap_caps_free(s_shadow_fb);  s_shadow_fb = NULL; }
+    if (s_gutter_dma) { heap_caps_free(s_gutter_dma); s_gutter_dma = NULL; }
+    if (s_shadow_mutex) xSemaphoreGive(s_shadow_mutex);
+    ESP_LOGI(TAG, "Partition single-writer end");
+}
+
+/* Blit both gutter columns from the shadow FB to the panel. MUST be called only
+ * from the camera consumer task (the sole SPI writer), never concurrently with
+ * the square blit. */
+void board_display_partition_blit_gutters(void)
+{
+    if (!s_cam_flush_redirect || !s_shadow_fb || !s_gutter_dma) return;
+    int32_t spans[2][2] = { { 0, s_sq_x1 - 1 }, { s_sq_x2 + 1, s_shadow_w - 1 } };
+    for (int g = 0; g < 2; g++) {
+        int32_t gx1 = spans[g][0], gx2 = spans[g][1];
+        int32_t gw = gx2 - gx1 + 1;
+        if (gw <= 0) continue;
+        for (int32_t y = 0; y < s_shadow_h; y += GUTTER_BAND_LINES) {
+            int32_t bh = (y + GUTTER_BAND_LINES > s_shadow_h) ? s_shadow_h - y : GUTTER_BAND_LINES;
+            if (s_shadow_mutex) xSemaphoreTake(s_shadow_mutex, portMAX_DELAY);
+            for (int32_t r = 0; r < bh; r++) {
+                memcpy(&s_gutter_dma[(size_t)r * gw],
+                       &s_shadow_fb[(size_t)(y + r) * s_shadow_w + gx1],
+                       (size_t)gw * 2);
+            }
+            if (s_shadow_mutex) xSemaphoreGive(s_shadow_mutex);
+            /* Synchronous: wait for the DMA before the next band reuses
+             * s_gutter_dma (draw_bitmap is async, trans_queue_depth=10). */
+            board_display_partition_blit(gx1, y, gx2 + 1, y + bh, s_gutter_dma);
+        }
+    }
+}
+#endif /* BOARD_CAMERA_PARTITION_MODE */
+#endif /* BOARD_DISPLAY_STD_SPI */
+
+void board_display_set_reserved_rect(int32_t x, int32_t y, int32_t w, int32_t h)
+{
+    if (w <= 0 || h <= 0) {
+        s_reserved_active = false;
+        return;
+    }
+    s_reserved_rect.x1 = x;
+    s_reserved_rect.y1 = y;
+    s_reserved_rect.x2 = x + w - 1;
+    s_reserved_rect.y2 = y + h - 1;
+    s_reserved_active = true;
+}
+
+void board_display_clear_reserved_rect(void)
+{
+    s_reserved_active = false;
+}
+
+#if !BOARD_CAMERA_PARTITION_MODE
+/* No-op stubs for boards that don't do single-writer partition compositing.
+ * (The real implementations live in the BOARD_CAMERA_PARTITION_MODE block below.)
+ * These keep the shared display-driver call sites unconditional. */
+esp_err_t board_display_partition_begin(int32_t disp_w, int32_t disp_h,
+                                        int32_t sq_x, int32_t sq_y,
+                                        int32_t sq_w, int32_t sq_h)
+{
+    (void)disp_w; (void)disp_h; (void)sq_x; (void)sq_y; (void)sq_w; (void)sq_h;
+    return ESP_OK;
+}
+void board_display_partition_end(void) {}
+void board_display_partition_blit_gutters(void) {}
+void board_display_partition_blit(int32_t x_start, int32_t y_start,
+                                  int32_t x_end, int32_t y_end, const void *buf)
+{ (void)x_start; (void)y_start; (void)x_end; (void)y_end; (void)buf; }
+#endif /* !BOARD_CAMERA_PARTITION_MODE */
+
 #if BOARD_HAS_IO_EXPANDER
 static esp_io_expander_handle_t expander_handle = NULL;
 #endif
@@ -483,28 +763,70 @@ static void lvgl_port_setup(const board_app_config_t *app_cfg,
     *disp_out = lvgl_port_add_disp(&disp_cfg);
 
 #else
-    /* Standard SPI boards (ST7796, ST7789): partial updates with PSRAM. */
+    /* Standard SPI boards (ST7796, ST7789): partial updates with small
+     * INTERNAL DMA draw buffers (not PSRAM).
+     *
+     * The GPSPI DMA cannot read PSRAM directly (on the P4 only AXI GDMA
+     * reaches external memory; GPSPI is served by AHB GDMA). With a PSRAM
+     * draw buffer, spi_master bounces EVERY flush through a freshly-malloc'd
+     * internal buffer of the full transfer size (~150 KB for a half-screen
+     * flush) — and errors out when that allocation fails. Observed on the
+     * P4 LCD 3.5: the very first LVGL flush died with `spi transmit (queue)
+     * color failed` and the panel never received a pixel. Small internal
+     * double buffers keep every flush DMA-direct — same approach as the
+     * camera preview stripe buffer in board_pipeline_display_lvgl.c. */
     lvgl_port_display_cfg_t disp_cfg = {
         .io_handle     = io_handle,
         .panel_handle  = panel_handle,
         .hres          = lvgl_hres,
         .vres          = lvgl_vres,
-        .buffer_size   = (uint32_t)lvgl_hres * (lvgl_vres / 2) * sizeof(lv_color16_t),
+        .buffer_size   = (uint32_t)lvgl_hres * (lvgl_vres / 8) * sizeof(lv_color16_t),
         .double_buffer = true,
         .flags = {
-            .buff_spiram = 1,
+            .buff_dma    = 1,
             .swap_bytes  = 1,
         },
     };
     *disp_out = lvgl_port_add_disp(&disp_cfg);
+
+    /* Partition-mode flush guard: lets the camera preview reserve its centered
+     * square so LVGL renders only the gutters beside it (board_display_*_rect).
+     * Inactive until a rect is set, so this is a no-op for normal screens and
+     * for boards that never enter partition mode. */
+    lvgl_port_lock(0);
+    lv_display_add_event_cb(*disp_out, invalidate_area_guard_cb,
+                            LV_EVENT_INVALIDATE_AREA, NULL);
+#if BOARD_CAMERA_PARTITION_MODE
+    /* Own the flush so a camera session can redirect LVGL off the SPI bus
+     * (single-writer compositing — see std_spi_partition_flush_cb). Take over the
+     * panel-IO completion callback too, so camera-path blits can wait for DMA
+     * completion (std_spi_blit_done_cb still signals LVGL flush_ready). */
+    s_std_disp = *disp_out;
+    if (!s_blit_sem) s_blit_sem = xSemaphoreCreateBinary();
+    lv_display_set_flush_cb(*disp_out, std_spi_partition_flush_cb);
+    esp_lcd_panel_io_callbacks_t part_io_cbs = { .on_color_trans_done = std_spi_blit_done_cb };
+    esp_lcd_panel_io_register_event_callbacks(io_handle, &part_io_cbs, NULL);
+#endif
+    lvgl_port_unlock();
 #endif
     assert(*disp_out != NULL);
 
     /* ── Panel MADCTL for standard SPI boards ── */
 #if BOARD_DISPLAY_DRIVER != DISPLAY_ST7701 && !BOARD_DISPLAY_QUIRK_RASET_BUG
+    /* Landscape mirror axes are per-board: the swap_xy+mirror pair selects one
+     * of the two 180°-apart landscape orientations, and which one is "up"
+     * depends on the panel's native scan direction. Boards where the default
+     * renders upside down override these in board_config.h (both axes must be
+     * toggled together to stay a pure rotation). */
+#ifndef BOARD_LANDSCAPE_MIRROR_X
+#define BOARD_LANDSCAPE_MIRROR_X 1
+#endif
+#ifndef BOARD_LANDSCAPE_MIRROR_Y
+#define BOARD_LANDSCAPE_MIRROR_Y 1
+#endif
     if (landscape) {
         esp_lcd_panel_swap_xy(panel_handle, true);
-        esp_lcd_panel_mirror(panel_handle, true, true);
+        esp_lcd_panel_mirror(panel_handle, BOARD_LANDSCAPE_MIRROR_X, BOARD_LANDSCAPE_MIRROR_Y);
     } else {
 #if defined(BOARD_DISPLAY_MIRROR_X) && BOARD_DISPLAY_MIRROR_X
         esp_lcd_panel_mirror(panel_handle, true, false);
