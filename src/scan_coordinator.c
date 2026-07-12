@@ -23,6 +23,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 
 static const char *TAG = "scan_coordinator";
 
@@ -72,6 +73,15 @@ struct scan_coordinator {
     scan_frame_status_t last_present_status;
     int                 last_present_percent;
     bool                completed;
+
+#ifdef CONFIG_CAM_PIPELINE_QR_DEBUG
+    /* Decode-rate stats -- written only by the decode task (on_frame), so no
+     * lock. Window counts reset each ~2s log; totals accumulate over the scan.
+     * dropped_new (above) is cumulative and reported as-is. */
+    uint32_t win_new, win_repeat, win_miss, win_none;
+    uint32_t tot_new, tot_repeat, tot_miss, tot_none;
+    int64_t  stats_last_log_us;
+#endif
 };
 
 /* ---- decode task ---- */
@@ -134,6 +144,37 @@ static void on_frame(cam_pipeline_qr_outcome_t outcome, const uint8_t *payload,
         break;
     }
     xSemaphoreGive(c->lock);
+
+#ifdef CONFIG_CAM_PIPELINE_QR_DEBUG
+    /* Per-frame outcome tally + ~2s rate line. Fields are decode-task-only, and
+     * c->latest was just set above, so no lock is needed here. Read the lines as
+     * a *series*: the decode rate swings within a scan (focus/aim/distance/
+     * stability), so a single window is not a benchmark -- the trend is. Compare
+     * new/s against the source animation fps: new/s < source => dropping source
+     * frames; repeat/s > 0 => outpacing the source (headroom). */
+    switch (c->latest) {
+    case SCAN_FRAME_NEW:    c->win_new++;    c->tot_new++;    break;
+    case SCAN_FRAME_REPEAT: c->win_repeat++; c->tot_repeat++; break;
+    case SCAN_FRAME_MISS:   c->win_miss++;   c->tot_miss++;   break;
+    case SCAN_FRAME_NONE:   c->win_none++;   c->tot_none++;   break;
+    default: break;
+    }
+    int64_t stats_now = esp_timer_get_time();
+    if (c->stats_last_log_us == 0) {
+        c->stats_last_log_us = stats_now;
+    } else if (stats_now - c->stats_last_log_us >= 2000000) {
+        float sec = (stats_now - c->stats_last_log_us) / 1000000.0f;
+        ESP_LOGI(TAG,
+                 "scan: new=%.1f/s rep=%.1f/s miss=%.1f/s none=%.1f/s drop=%u "
+                 "| tot new=%u rep=%u miss=%u none=%u",
+                 c->win_new / sec, c->win_repeat / sec, c->win_miss / sec,
+                 c->win_none / sec, (unsigned)c->dropped_new,
+                 (unsigned)c->tot_new, (unsigned)c->tot_repeat,
+                 (unsigned)c->tot_miss, (unsigned)c->tot_none);
+        c->win_new = c->win_repeat = c->win_miss = c->win_none = 0;
+        c->stats_last_log_us = stats_now;
+    }
+#endif
 }
 
 /* ---- consumer task ---- */
