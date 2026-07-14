@@ -52,6 +52,13 @@ cam_pipeline_config_t board_pipeline_default_config(void *display_parent,
     s_lvgl_display_config.keep_lvgl_running = BOARD_CAMERA_PARTITION_MODE;
 #endif
 
+    /* Portrait-scan direct blit is off by default (clean opt-in per session): the
+     * static config is reused across sessions, so reset it here or a prior
+     * portrait scan would leak into the next (landscape) session. */
+    s_lvgl_display_config.portrait_direct = false;
+    s_lvgl_display_config.portrait_x = 0;
+    s_lvgl_display_config.portrait_y = 0;
+
     /* Camera pre-rotation into the single PPA SRM pass (crop+scale+rotate).
      * DSI landscape (ST7701): the display flush rotates the whole LVGL canvas
      *   90° CCW to the portrait panel, so pre-rotate the camera 90° CW to match.

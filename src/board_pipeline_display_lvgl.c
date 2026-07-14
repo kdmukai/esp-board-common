@@ -29,6 +29,16 @@
 
 static const char *TAG = "pipeline_disp_lvgl";
 
+/* ── Phase-0 THROUGHPUT PROBE (throwaway; remove before merge) ─────────────
+ * Free core 0 for a 2nd decoder by throttling the DSI preview. On the 4.3 the
+ * image-widget push invalidates the whole screen every frame → a full
+ * RENDER_MODE_FULL render + a ~30ms CPU 90° rotate-flush, which pegs core 0.
+ * Pushing only every Nth frame cuts that cost ~N× while keeping a laggy-but-
+ * usable preview so the operator can still AIM (a blind scan would corrupt the
+ * throughput measurement). 1 = disabled (every frame). The cpu_load: probe in
+ * cam_pipeline_qr.c reports how free core 0 actually got. */
+#define CAM_PROBE_PREVIEW_DIVISOR 1
+
 #define DMA_STRIPE_LINES_DEFAULT  120
 #define DMA_STRIPE_LINES_MIN      10
 #define DMA_BUF_ALIGN             64   /* safe for SPI DMA on all targets */
@@ -71,6 +81,11 @@ typedef struct {
     /* Per-frame overlay compositing */
     pipeline_overlay_cb_t overlay_cb;
     void *overlay_cb_ctx;
+
+    /* Portrait-scan direct blit (ST7701/DSI) */
+    bool    portrait_direct;
+    int32_t portrait_x;
+    int32_t portrait_y;
 } lvgl_display_ctx_t;
 
 /* ── Dummy-draw push: striped DMA blit bypassing LVGL ── */
@@ -189,6 +204,22 @@ static bool push_frame_image_widget(lvgl_display_ctx_t *ctx,
     return true;
 }
 
+/* ── Portrait-scan direct blit (ST7701/DSI): camera square → panel ── */
+
+static bool push_frame_portrait_direct(lvgl_display_ctx_t *ctx,
+                                       const uint8_t *rgb565_buf,
+                                       uint32_t width, uint32_t height)
+{
+    /* Blit the camera square straight into the reserved portrait region through
+     * the single-writer gate (serializes vs LVGL's letterbox flush on the shared
+     * DMA2D path). Native portrait ⇒ no rotation, no LVGL image widget. */
+    board_display_portrait_scan_blit(ctx->portrait_x, ctx->portrait_y,
+                                     ctx->portrait_x + (int32_t)width,
+                                     ctx->portrait_y + (int32_t)height,
+                                     rgb565_buf);
+    return true;
+}
+
 /* ── Driver interface ── */
 
 static void *lvgl_display_init(void *parent, uint32_t width, uint32_t height,
@@ -211,6 +242,21 @@ static void *lvgl_display_init(void *parent, uint32_t width, uint32_t height,
     ctx->byte_swap = cfg ? cfg->byte_swap : false;
     ctx->overlay_cb = cfg ? cfg->overlay_cb : NULL;
     ctx->overlay_cb_ctx = cfg ? cfg->overlay_cb_ctx : NULL;
+    ctx->portrait_direct = cfg ? cfg->portrait_direct : false;
+    ctx->portrait_x = cfg ? cfg->portrait_x : 0;
+    ctx->portrait_y = cfg ? cfg->portrait_y : 0;
+
+    /* Portrait direct-blit: no LVGL widget, no DMA/cam buffer — frames go straight
+     * to the panel square via the single-writer gate. The display must already be
+     * in portrait-scan mode (board_display_enter_portrait_scan) and the letterbox
+     * chrome is owned by the caller's LVGL screen. */
+    if (ctx->portrait_direct) {
+        ESP_LOGI(TAG, "LVGL display driver: portrait direct-blit (%"PRIu32"x%"PRIu32
+                 " at +%"PRId32",+%"PRId32")", width, height,
+                 ctx->portrait_x, ctx->portrait_y);
+        return ctx;
+    }
+
     size_t buf_size = width * height * 2; /* RGB565 */
 
     /* Allocate PSRAM buffer (image widget mode needs it always;
@@ -384,6 +430,24 @@ static bool lvgl_display_push_frame(void *handle, const uint8_t *rgb565_buf,
 {
     lvgl_display_ctx_t *ctx = (lvgl_display_ctx_t *)handle;
     if (!ctx) return false;
+
+    if (ctx->portrait_direct) {
+        /* No overlay_cb here: portrait chrome is separate LVGL letterbox, not
+         * composited onto the camera frame. */
+        return push_frame_portrait_direct(ctx, rgb565_buf, width, height);
+    }
+
+#if CAM_PROBE_PREVIEW_DIVISOR > 1
+    /* PROBE: throttle the preview to free core 0 for a 2nd decoder. Skip the
+     * overlay+render+rotate on all but every Nth frame, but return true so the
+     * pipeline keeps front_consumed set and frames keep flowing to the decoders.
+     * The DSI peripheral still scans out the (now stale) framebuffer, so the
+     * underrun watch stays valid. */
+    static uint32_t s_probe_push_count = 0;
+    if ((s_probe_push_count++ % CAM_PROBE_PREVIEW_DIVISOR) != 0) {
+        return true;
+    }
+#endif
 
     /* Overlay compositing — modifies frame buffer in place before display.
      * Cast away const: the pipeline buffer is writable, const is advisory. */
