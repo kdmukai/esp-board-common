@@ -23,6 +23,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 
 static const char *TAG = "scan_coordinator";
 
@@ -72,9 +73,48 @@ struct scan_coordinator {
     scan_frame_status_t last_present_status;
     int                 last_present_percent;
     bool                completed;
+
+#ifdef CONFIG_CAM_PIPELINE_QR_DEBUG
+    /* Decode-rate stats -- written only by the decode task (on_frame), so no
+     * lock. Window counts reset each ~2s log; totals accumulate over the scan.
+     * dropped_new (above) is cumulative and reported as-is. */
+    uint32_t win_new, win_repeat, win_miss, win_none;
+    uint32_t tot_new, tot_repeat, tot_miss, tot_none;
+    int64_t  stats_last_log_us;
+    const char *seq;  /* scan-source class (UR/BBQR/SEEDQR/...), set on 1st decode */
+#endif
 };
 
 /* ---- decode task ---- */
+
+#ifdef CONFIG_CAM_PIPELINE_QR_DEBUG
+/* Coarse scan-source classifier from a decoded payload's shape/prefix -- diagnostic
+ * only (the Python DecodeQR consumer does the authoritative parse). Lets a capture
+ * self-label the QR under test: UR / BBQr animation vs a static SeedQR, descriptor,
+ * etc. Returns a static string (never NULL). */
+static const char *classify_seq(const uint8_t *p, size_t n) {
+    if (!p || n == 0) return "?";
+    /* UR: QR alphanumeric mode uppercases, so the payload is "UR:" not "ur:". */
+    if (n >= 3 && (p[0] == 'u' || p[0] == 'U') && (p[1] == 'r' || p[1] == 'R') &&
+        p[2] == ':')                                         return "UR";
+    if (n >= 2 && p[0] == 'B' && p[1] == '$')                return "BBQR";
+    if (n >= 7 && memcmp(p, "cHNidP8", 7) == 0)              return "PSBT"; /* base64 */
+    if (n >= 4 && (!memcmp(p, "xpub", 4) || !memcmp(p, "ypub", 4) ||
+                   !memcmp(p, "zpub", 4) || !memcmp(p, "tpub", 4) ||
+                   !memcmp(p, "vpub", 4) || !memcmp(p, "upub", 4)))  return "XPUB";
+    if ((n >= 5 && !memcmp(p, "wpkh(", 5)) ||
+        (n >= 4 && (!memcmp(p, "wsh(", 4) || !memcmp(p, "pkh(", 4))) ||
+        (n >= 3 && (!memcmp(p, "sh(", 3)  || !memcmp(p, "tr(", 3)))) return "DESC";
+    if (n >= 3 && (!memcmp(p, "bc1", 3) || !memcmp(p, "tb1", 3)))    return "ADDR";
+    bool all_digits = true;
+    for (size_t i = 0; i < n; i++) {
+        if (p[i] < '0' || p[i] > '9') { all_digits = false; break; }
+    }
+    if (all_digits && n >= 48) return "SEEDQR";  /* 4 digits/word */
+    if (n == 16 || n == 32)    return "CSEEDQR"; /* raw entropy bytes */
+    return "OTHER";
+}
+#endif
 
 /* Engine per-frame outcome -> transport dedup -> NEW ring / status cell. */
 static void on_frame(cam_pipeline_qr_outcome_t outcome, const uint8_t *payload,
@@ -88,6 +128,9 @@ static void on_frame(cam_pipeline_qr_outcome_t outcome, const uint8_t *payload,
         if (len > K_QUIRC_MAX_PAYLOAD) {
             len = K_QUIRC_MAX_PAYLOAD;  /* defensive clamp */
         }
+#ifdef CONFIG_CAM_PIPELINE_QR_DEBUG
+        if (!c->seq) c->seq = classify_seq(payload, len);  /* label the scan source */
+#endif
         bool same = c->have_last_fwd && len == c->last_fwd_len &&
                     (len == 0 || memcmp(payload, c->last_fwd, len) == 0);
         if (same) {
@@ -133,6 +176,40 @@ static void on_frame(cam_pipeline_qr_outcome_t outcome, const uint8_t *payload,
         c->consecutive_misses = 0;
         break;
     }
+
+#ifdef CONFIG_CAM_PIPELINE_QR_DEBUG
+    /* Per-frame outcome tally + ~2s rate line. Kept INSIDE c->lock: the Phase-0
+     * throughput probe runs TWO decode tasks, so on_frame has two producers --
+     * an unlocked tally would race the counters and corrupt the new/s metric the
+     * probe exists to measure. c->latest was just set above. Read the lines as
+     * a *series*: the decode rate swings within a scan (focus/aim/distance/
+     * stability), so a single window is not a benchmark -- the trend is. Compare
+     * new/s against the source animation fps: new/s < source => dropping source
+     * frames; repeat/s > 0 => outpacing the source (headroom). */
+    switch (c->latest) {
+    case SCAN_FRAME_NEW:    c->win_new++;    c->tot_new++;    break;
+    case SCAN_FRAME_REPEAT: c->win_repeat++; c->tot_repeat++; break;
+    case SCAN_FRAME_MISS:   c->win_miss++;   c->tot_miss++;   break;
+    case SCAN_FRAME_NONE:   c->win_none++;   c->tot_none++;   break;
+    default: break;
+    }
+    int64_t stats_now = esp_timer_get_time();
+    if (c->stats_last_log_us == 0) {
+        c->stats_last_log_us = stats_now;
+    } else if (stats_now - c->stats_last_log_us >= 2000000) {
+        float sec = (stats_now - c->stats_last_log_us) / 1000000.0f;
+        ESP_LOGI(TAG,
+                 "scan: seq=%s new=%.1f/s rep=%.1f/s miss=%.1f/s none=%.1f/s drop=%u "
+                 "| tot new=%u rep=%u miss=%u none=%u",
+                 c->seq ? c->seq : "?",
+                 c->win_new / sec, c->win_repeat / sec, c->win_miss / sec,
+                 c->win_none / sec, (unsigned)c->dropped_new,
+                 (unsigned)c->tot_new, (unsigned)c->tot_repeat,
+                 (unsigned)c->tot_miss, (unsigned)c->tot_none);
+        c->win_new = c->win_repeat = c->win_miss = c->win_none = 0;
+        c->stats_last_log_us = stats_now;
+    }
+#endif
     xSemaphoreGive(c->lock);
 }
 
@@ -240,6 +317,7 @@ scan_coordinator_t *scan_coordinator_create(const scan_coordinator_config_t *con
         .frame_height = config->frame_height,
         .on_frame = on_frame,
         .user_ctx = c,
+        .num_decoders = config->num_decoders,
     };
     c->qr = cam_pipeline_qr_create(&qr_cfg);
     if (!c->qr) {

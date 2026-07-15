@@ -23,6 +23,10 @@
 
 #include "board_i2c.h"
 #include "board_backlight.h"
+#if BOARD_HAS_CAMERA
+#include "board_pipeline.h"
+#include "board_pipeline_display_lvgl.h"
+#endif
 
 #if BOARD_HAS_PMIC
 #include "board_pmic.h"
@@ -501,6 +505,75 @@ static SemaphoreHandle_t st7701_flush_start_sem = NULL;  /* flush_cb  -> task   
 static SemaphoreHandle_t st7701_flush_done_sem  = NULL;  /* task -> flush_wait_cb */
 static uint16_t *st7701_flush_fb = NULL;                 /* buffer handed to task */
 
+/* ── Portrait scan mode (Phase 1) state ──
+ * The normal UI renders landscape (800×480) + CPU-rotates every frame to the
+ * native-portrait panel. A QR scan switches the SAME display in place to native
+ * portrait (480×800) with NO rotation so the camera can sub-region blit and core
+ * 0 is freed. These are captured from lvgl_port_setup so enter/exit can reconfig
+ * the live display and restore it. */
+static lv_display_t     *s_st7701_disp = NULL;
+static void             *s_st7701_draw_buf[2] = {NULL, NULL};
+static size_t            s_st7701_draw_buf_sz = 0;
+static bool              s_portrait_scan_active = false;
+/* Blit-completion signal for the portrait direct flush: use_dma2d=true makes DPI
+ * draw_bitmap from an external (LVGL draw) buffer async, so the flush must wait
+ * for the DMA2D copy before releasing the buffer back to LVGL. Given from the
+ * panel's on_color_trans_done (registered alongside on_refresh_done in setup). */
+static SemaphoreHandle_t s_dsi_blit_done = NULL;
+/* Serializes the two portrait-scan writers (camera square + LVGL letterbox flush)
+ * through the panel's one DMA2D draw path. */
+static SemaphoreHandle_t s_dsi_blit_mutex = NULL;
+
+static bool dpi_color_trans_done_cb(esp_lcd_panel_handle_t panel,
+                                    esp_lcd_dpi_panel_event_data_t *edata,
+                                    void *user_ctx)
+{
+    (void)panel; (void)edata; (void)user_ctx;
+    BaseType_t woken = pdFALSE;
+    if (s_dsi_blit_done) xSemaphoreGiveFromISR(s_dsi_blit_done, &woken);
+    return (woken == pdTRUE);
+}
+
+/* Single-writer gate: draw_bitmap + wait for the (async, use_dma2d) copy, under a
+ * mutex so the camera square and the LVGL letterbox flush never issue overlapping
+ * draw_bitmaps (which would trip the DPI driver's draw_sem). */
+void board_display_portrait_scan_blit(int32_t x1, int32_t y1,
+                                      int32_t x2, int32_t y2, const void *buf)
+{
+    if (!s_dsi_blit_mutex) return;
+    xSemaphoreTake(s_dsi_blit_mutex, portMAX_DELAY);
+    if (s_dsi_blit_done) xSemaphoreTake(s_dsi_blit_done, 0);            /* drain stale */
+    esp_lcd_panel_draw_bitmap(panel_handle, x1, y1, x2, y2, buf);
+    if (s_dsi_blit_done) xSemaphoreTake(s_dsi_blit_done, pdMS_TO_TICKS(100));
+    xSemaphoreGive(s_dsi_blit_mutex);
+}
+
+/* Portrait reserved-rect guard: clips LVGL invalidations OUT of the centered
+ * camera square (full-width band, so clip on Y — keep the top/bottom letterbox),
+ * the DSI analog of the SPI gutter guard. Inactive until enter_portrait sets a
+ * rect. Belt-and-suspenders: keeping chrome in the letterbox is the primary
+ * guarantee; this stops a stray full-screen invalidation from repainting the
+ * square over the live camera. */
+static void dsi_portrait_invalidate_guard_cb(lv_event_t *e)
+{
+    if (!s_reserved_active) return;
+    lv_area_t *a = (lv_area_t *)lv_event_get_param(e);
+    if (!a) return;
+
+    if (a->x2 < s_reserved_rect.x1 || a->x1 > s_reserved_rect.x2 ||
+        a->y2 < s_reserved_rect.y1 || a->y1 > s_reserved_rect.y2) {
+        return;  /* no overlap with the reserved square */
+    }
+    if (a->y1 < s_reserved_rect.y1) {
+        a->y2 = s_reserved_rect.y1 - 1;   /* keep top-letterbox slab */
+    } else if (a->y2 > s_reserved_rect.y2) {
+        a->y1 = s_reserved_rect.y2 + 1;   /* keep bottom-letterbox slab */
+    } else {
+        a->x2 = a->x1;                    /* fully inside → 1px no-op */
+        a->y2 = a->y1;
+    }
+}
+
 static bool dpi_vsync_ready_cb(esp_lcd_panel_handle_t panel,
                                esp_lcd_dpi_panel_event_data_t *edata,
                                void *user_ctx)
@@ -571,6 +644,19 @@ static void st7701_rotate_and_blit(uint16_t *fb)
     xSemaphoreTake(dpi_flush_sem, portMAX_DELAY); /* wait for vsync start */
     esp_lcd_panel_draw_bitmap(panel_handle, 0, 0,
                               BOARD_LCD_H_RES, BOARD_LCD_V_RES, out);
+    /* Wait for the DMA2D trans to COMPLETE (not merely be issued) before returning.
+     * draw_bitmap is async (use_dma2d): it takes the panel's draw_sem and releases
+     * it in on_color_trans_done (which also feeds s_dsi_blit_done). Returning here
+     * without waiting left draw_sem held, so (a) the double-buffer swap below could
+     * reuse st7701_rot_buf[idx] while its trans was still reading it, and (b) the
+     * first portrait blit on a scan-mode switch tripped the DPI "previous draw
+     * operation is not finished" check on re-entry. The flush task is idle-paced by
+     * st7701_flush_start_sem, so this ~few-ms wait overlaps the next LVGL render and
+     * doesn't slow the UI. s_dsi_blit_done is empty here (the prior rotate consumed
+     * its token), so this waits for exactly this draw's completion. */
+    if (s_dsi_blit_done) {
+        xSemaphoreTake(s_dsi_blit_done, pdMS_TO_TICKS(100));
+    }
     st7701_rot_idx ^= 1;                          /* swap output buffers */
 }
 
@@ -621,7 +707,124 @@ static void st7701_flush_wait_cb(lv_display_t *disp)
     xSemaphoreTake(st7701_flush_done_sem, portMAX_DELAY);
 }
 
+/* ── Portrait scan flush ──
+ * Native-portrait, NO rotation: LVGL renders (PARTIAL) directly in panel
+ * coordinates, so each dirty area blits straight to the panel. draw_bitmap from
+ * an external buffer is async (DMA2D), so wait for the copy (drain-before,
+ * wait-after on s_dsi_blit_done) before flush_ready, or LVGL reuses px_map
+ * mid-copy and the next draw_bitmap trips the driver's draw_sem (INVALID_STATE).
+ * Runs under the LVGL lock (esp_lvgl_port wraps lv_timer_handler); the ~2-4 ms
+ * DMA2D copy of a letterbox strip is short enough not to starve the camera's
+ * try-lock push. */
+static void st7701_portrait_flush_cb(lv_display_t *disp,
+                                     const lv_area_t *area, uint8_t *px_map)
+{
+    /* Through the single-writer gate so a concurrent camera-square blit can't
+     * collide on the panel's DMA2D draw path. */
+    board_display_portrait_scan_blit(area->x1, area->y1,
+                                     area->x2 + 1, area->y2 + 1, px_map);
+    lv_display_flush_ready(disp);
+}
+
+/* Drain the deferred-rotate handshake so a stale token can't desync the 1:1
+ * flush_cb→flush_wait pairing across a mode switch. Absorbs one in-flight rotate
+ * (short wait), then clears both sems + the stale vsync. Caller holds the LVGL
+ * lock, so no NEW landscape flush can start while we drain. */
+static void st7701_quiesce_flush(void)
+{
+    xSemaphoreTake(st7701_flush_done_sem, pdMS_TO_TICKS(60)); /* in-flight rotate */
+    while (xSemaphoreTake(st7701_flush_start_sem, 0) == pdTRUE) { }
+    while (xSemaphoreTake(st7701_flush_done_sem, 0) == pdTRUE) { }
+    xSemaphoreTake(dpi_flush_sem, 0);
+}
+
+void board_display_enter_portrait_scan(void)
+{
+    if (!s_st7701_disp || s_portrait_scan_active) return;
+    lvgl_port_lock(0);
+
+    /* Settle the deferred rotate, then force disp->flushing clear so portrait's
+     * NULL flush_wait_cb doesn't busy-spin on a landscape flush that never
+     * completes. */
+    st7701_quiesce_flush();
+    /* st7701_rotate_and_blit now waits for its DMA2D trans-done before signalling
+     * st7701_flush_done_sem, so the quiesce above already guarantees the panel's
+     * draw_sem is free -- no separate trans-drain needed here for the first portrait
+     * blit (fixes the DPI "previous draw not finished" on scan re-entry at the
+     * source). */
+    lv_display_flush_ready(s_st7701_disp);
+
+    lv_display_set_resolution(s_st7701_disp, BOARD_LCD_H_RES, BOARD_LCD_V_RES);
+    lv_display_set_buffers(s_st7701_disp, s_st7701_draw_buf[0],
+                           s_st7701_draw_buf[1], s_st7701_draw_buf_sz,
+                           LV_DISPLAY_RENDER_MODE_PARTIAL);
+    lv_display_set_flush_cb(s_st7701_disp, st7701_portrait_flush_cb);
+    lv_display_set_flush_wait_cb(s_st7701_disp, NULL);
+
+    /* Touch → native portrait (GT911 is configured landscape: swap_xy=1,
+     * mirror_y=1). Undo to the panel's native orientation. */
+    if (touch_handle) {
+        touch_handle->config.flags.swap_xy  = 0;
+        touch_handle->config.flags.mirror_x = 0;
+        touch_handle->config.flags.mirror_y = 0;
+    }
+
+    /* Fence LVGL out of the centered 480×480 camera square (rows 160–639); it
+     * renders only the top/bottom letterbox. The camera owns the square. */
+    board_display_set_reserved_rect(0, (BOARD_LCD_V_RES - BOARD_LCD_H_RES) / 2,
+                                    BOARD_LCD_H_RES, BOARD_LCD_H_RES);
+
+    s_portrait_scan_active = true;
+    lv_obj_invalidate(lv_display_get_screen_active(s_st7701_disp));
+    lvgl_port_unlock();
+    ESP_LOGI(TAG, "portrait scan mode: ENTER (480x800, no rotation)");
+}
+
+void board_display_exit_portrait_scan(void)
+{
+    if (!s_st7701_disp || !s_portrait_scan_active) return;
+    lvgl_port_lock(0);
+
+    lv_display_flush_ready(s_st7701_disp);  /* portrait flush is synchronous; belt+braces */
+
+    lv_display_set_resolution(s_st7701_disp, BOARD_LCD_V_RES, BOARD_LCD_H_RES);
+    lv_display_set_buffers(s_st7701_disp, s_st7701_draw_buf[0],
+                           s_st7701_draw_buf[1], s_st7701_draw_buf_sz,
+                           LV_DISPLAY_RENDER_MODE_FULL);
+    lv_display_set_flush_cb(s_st7701_disp, st7701_landscape_flush_cb);
+    lv_display_set_flush_wait_cb(s_st7701_disp, st7701_flush_wait_cb);
+
+    /* Drain + clear flushing so the first landscape flush self-primes (flushing
+     * clear → LVGL skips flush_wait_cb on the first flush, which gives done_sem
+     * for the second flush's wait). */
+    st7701_quiesce_flush();
+    lv_display_flush_ready(s_st7701_disp);
+
+    if (touch_handle) {
+        touch_handle->config.flags.swap_xy  = 1;
+        touch_handle->config.flags.mirror_x = 0;
+        touch_handle->config.flags.mirror_y = 1;
+    }
+
+    board_display_clear_reserved_rect();
+
+    s_portrait_scan_active = false;
+    lv_obj_invalidate(lv_display_get_screen_active(s_st7701_disp));
+    lvgl_port_unlock();
+    ESP_LOGI(TAG, "portrait scan mode: EXIT (800x480, rotation restored)");
+}
+
 #endif /* BOARD_DISPLAY_DRIVER == DISPLAY_ST7701 */
+
+#if BOARD_DISPLAY_DRIVER != DISPLAY_ST7701
+/* Portrait scan mode is an ST7701/DSI-only optimization (other boards partition
+ * via reserved-rect or are already portrait). No-op stubs so callers link. */
+void board_display_enter_portrait_scan(void) {}
+void board_display_exit_portrait_scan(void) {}
+void board_display_portrait_scan_blit(int32_t x1, int32_t y1,
+                                      int32_t x2, int32_t y2, const void *buf)
+{ (void)x1; (void)y1; (void)x2; (void)y2; (void)buf; }
+#endif
 
 /* ── IO Expander ── */
 #if BOARD_HAS_IO_EXPANDER
@@ -695,7 +898,15 @@ static void lvgl_port_setup(const board_app_config_t *app_cfg,
         st7701_rot_buf[1] = heap_caps_malloc(rot_buf_sz, MALLOC_CAP_SPIRAM);
         assert(buf1 && buf2 && st7701_rot_buf[0] && st7701_rot_buf[1]);
 
+        /* Retain for the portrait-scan mode switch (reuses these same buffers in
+         * PARTIAL mode; draw_buf_sz is identical either orientation). */
+        s_st7701_draw_buf[0] = buf1;
+        s_st7701_draw_buf[1] = buf2;
+        s_st7701_draw_buf_sz = draw_buf_sz;
+
         dpi_flush_sem = xSemaphoreCreateBinary();
+        s_dsi_blit_done = xSemaphoreCreateBinary();
+        s_dsi_blit_mutex = xSemaphoreCreateMutex();
 
         /* Deferred-flush plumbing — created BEFORE the display so the flush task
          * is ready before esp_lvgl_port can call the flush_cb. */
@@ -722,11 +933,25 @@ static void lvgl_port_setup(const board_app_config_t *app_cfg,
         lv_display_set_flush_wait_cb(disp, st7701_flush_wait_cb);
         lvgl_port_unlock();
 
+        /* Register BOTH callbacks in one call (the driver copies both fields, so
+         * a later single-field re-register would NULL the other): on_refresh_done
+         * gates the landscape rotate on vsync; on_color_trans_done signals the
+         * portrait direct flush's DMA2D copy completion. */
         esp_lcd_dpi_panel_event_callbacks_t dpi_cbs = {
-            .on_refresh_done = dpi_vsync_ready_cb,
+            .on_refresh_done     = dpi_vsync_ready_cb,
+            .on_color_trans_done = dpi_color_trans_done_cb,
         };
         esp_lcd_dpi_panel_register_event_callbacks(panel_handle, &dpi_cbs, disp);
 
+        /* Portrait reserved-rect guard (inactive until enter_portrait sets a
+         * rect): fences LVGL out of the centered camera square so the letterbox
+         * flush never repaints over the live preview. */
+        lvgl_port_lock(0);
+        lv_display_add_event_cb(disp, dsi_portrait_invalidate_guard_cb,
+                                LV_EVENT_INVALIDATE_AREA, NULL);
+        lvgl_port_unlock();
+
+        s_st7701_disp = disp;
         *disp_out = disp;
     } else {
         /* MIPI-DSI portrait: direct mode with DPI hardware framebuffers.
@@ -859,6 +1084,150 @@ static void lvgl_port_setup(const board_app_config_t *app_cfg,
     }
 }
 
+/* ── Phase-1 CP1 portrait-scan self-test (throwaway; autonomous device check) ──
+ * With no human to drive the UI to a scan, this task toggles portrait mode on the
+ * live app screen so a webcam + serial can confirm the display-mode switch works
+ * before the camera/reserved-rect/overlay layers (CP2+) are built. Set to 0 to
+ * disable. ST7701 only. */
+#define CP1_PORTRAIT_TEST 0
+
+#if CP1_PORTRAIT_TEST && (BOARD_DISPLAY_DRIVER == DISPLAY_ST7701) && BOARD_HAS_CAMERA
+/* Portrait-scan self-test (throwaway; autonomous device validation): LVGL chrome
+ * ONLY in the top/bottom letterbox + a real camera preview direct-blitted into
+ * the centered 480×480 square through the single-writer gate. Validates the whole
+ * portrait composite (reserved-rect + gate + real camera path) WITHOUT the app's
+ * scan-navigation or a QR — the webcam sees the live preview. */
+#define CP2_SQ  480                              /* square side           */
+#define CP2_SY  ((BOARD_LCD_V_RES - CP2_SQ) / 2) /* square top row (=160) */
+
+static void cp2_add_letterbox_bg(lv_obj_t *scr, int y, uint32_t color)
+{
+    lv_obj_t *bg = lv_obj_create(scr);
+    lv_obj_remove_style_all(bg);
+    lv_obj_set_size(bg, CP2_SQ, CP2_SY);   /* 480 × 160 letterbox strip */
+    lv_obj_set_pos(bg, 0, y);
+    lv_obj_set_style_bg_color(bg, lv_color_hex(color), 0);
+    lv_obj_set_style_bg_opa(bg, LV_OPA_COVER, 0);
+}
+
+static lv_obj_t *cp2_make_letterbox_screen(void)
+{
+    /* Portrait 480×800 showcase: real LVGL widgets ONLY in the top/bottom
+     * letterbox (never over the camera square 160..639), mimicking the scan
+     * overlay. Each letterbox has its own opaque bg obj that self-invalidates
+     * (so it paints even though the screen-load full invalidation is reserved-
+     * rect-clipped to one side). */
+    lv_obj_t *scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), 0);
+    cp2_add_letterbox_bg(scr, 0, 0x101418);                 /* top    */
+    cp2_add_letterbox_bg(scr, CP2_SY + CP2_SQ, 0x101418);   /* bottom (y=640) */
+
+    /* Top letterbox: title bar + status text. */
+    lv_obj_t *bar = lv_obj_create(scr);
+    lv_obj_remove_style_all(bar);
+    lv_obj_set_size(bar, 440, 96);
+    lv_obj_set_pos(bar, 20, 32);
+    lv_obj_set_style_bg_color(bar, lv_color_hex(0x1E66FF), 0);
+    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(bar, 14, 0);
+    lv_obj_t *title = lv_label_create(bar);
+    lv_label_set_text(title, "SCANNING QR");
+    lv_obj_set_style_text_color(title, lv_color_white(), 0);
+    lv_obj_center(title);
+
+    /* Bottom letterbox: progress bar (track + 58% indicator, plain objs so no
+     * LV_USE_BAR dependency) + percent + back chevron. */
+    lv_obj_t *track = lv_obj_create(scr);
+    lv_obj_remove_style_all(track);
+    lv_obj_set_size(track, 380, 36);
+    lv_obj_set_pos(track, 50, 684);
+    lv_obj_set_style_bg_color(track, lv_color_hex(0x303840), 0);
+    lv_obj_set_style_bg_opa(track, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(track, 8, 0);
+    lv_obj_t *ind = lv_obj_create(scr);
+    lv_obj_remove_style_all(ind);
+    lv_obj_set_size(ind, 380 * 58 / 100, 36);
+    lv_obj_set_pos(ind, 50, 684);
+    lv_obj_set_style_bg_color(ind, lv_color_hex(0x00E676), 0);
+    lv_obj_set_style_bg_opa(ind, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(ind, 8, 0);
+
+    lv_obj_t *pct = lv_label_create(scr);
+    lv_label_set_text(pct, "58%");
+    lv_obj_set_style_text_color(pct, lv_color_white(), 0);
+    lv_obj_set_pos(pct, 210, 732);
+
+    lv_obj_t *back = lv_label_create(scr);
+    lv_label_set_text(back, LV_SYMBOL_LEFT "  BACK");
+    lv_obj_set_style_text_color(back, lv_color_hex(0xFFC107), 0);
+    lv_obj_set_pos(back, 30, 730);
+    return scr;
+}
+
+/* CP3: REAL camera preview in portrait — start an actual cam_pipeline whose
+ * frames direct-blit into the square (portrait_direct) while LVGL renders the
+ * letterbox chrome. Validates the real camera→portrait-square path (orientation,
+ * offsets, the gate under real frame rate, DSI underrun with a live PSRAM reader)
+ * WITHOUT the app's scan-navigation or a QR — the webcam sees the live preview. */
+static void cp2_camera_portrait_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(12000));  /* let the app settle at Home */
+    ESP_LOGI(TAG, "CP3 real-camera portrait preview: START");
+
+    lvgl_port_lock(0);
+    lv_obj_t *prev = lv_screen_active();
+    lvgl_port_unlock();
+
+    board_display_enter_portrait_scan();
+
+    lvgl_port_lock(0);
+    lv_obj_t *scr = cp2_make_letterbox_screen();
+    lv_screen_load(scr);
+    lvgl_port_unlock();
+
+    /* One-time black-square clear: the FB holds the stale rotated landscape frame
+     * until the first camera frame (~500 ms warmup). */
+    uint16_t *black = heap_caps_aligned_alloc(128, CP2_SQ * CP2_SQ * 2,
+                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (black) {
+        memset(black, 0, (size_t)CP2_SQ * CP2_SQ * 2);
+        board_display_portrait_scan_blit(0, CP2_SY, CP2_SQ, CP2_SY + CP2_SQ, black);
+        heap_caps_free(black);
+    }
+
+    /* Real camera pipeline: 480×480 square, rotation 0 (native portrait, no
+     * rotate), frames blitted straight into the square through the gate. */
+    cam_pipeline_config_t pcfg =
+        board_pipeline_default_config(scr, board_i2c_get_handle());
+    pcfg.display_width  = CP2_SQ;
+    pcfg.display_height = CP2_SQ;
+    pcfg.rotation       = 0;
+    board_pipeline_lvgl_display_config_t *dc =
+        (board_pipeline_lvgl_display_config_t *)pcfg.display_config;
+    dc->portrait_direct = true;
+    dc->portrait_x = 0;
+    dc->portrait_y = CP2_SY;
+
+    cam_pipeline_handle_t pipe = cam_pipeline_create(&pcfg);
+    if (!pipe) {
+        ESP_LOGE(TAG, "CP3: camera pipeline create FAILED");
+    } else {
+        ESP_LOGI(TAG, "CP3: LIVE camera in portrait square + LVGL letterbox (35s)");
+        vTaskDelay(pdMS_TO_TICKS(35000));
+        cam_pipeline_destroy(pipe);
+    }
+
+    lvgl_port_lock(0);
+    lv_screen_load(prev);
+    lv_obj_delete(scr);
+    lvgl_port_unlock();
+    board_display_exit_portrait_scan();
+    ESP_LOGI(TAG, "CP3: DONE (landscape restored, parking)");
+    vTaskSuspend(NULL);
+}
+#endif
+
 /* ── Board interface implementation ── */
 
 int board_init(const board_app_config_t *app_cfg,
@@ -975,6 +1344,11 @@ int board_init(const board_app_config_t *app_cfg,
     lvgl_port_setup(app_cfg, disp, touch_indev);
 
     ESP_LOGI(TAG, "Board initialized (landscape=%d).", landscape);
+
+#if CP1_PORTRAIT_TEST && (BOARD_DISPLAY_DRIVER == DISPLAY_ST7701) && BOARD_HAS_CAMERA
+    xTaskCreatePinnedToCore(cp2_camera_portrait_task, "cp3_cam", 8192, NULL,
+                            2, NULL, tskNO_AFFINITY);
+#endif
     return 0;
 }
 

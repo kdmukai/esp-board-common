@@ -85,6 +85,11 @@ typedef struct {
     void            *complete_ctx;
 
     size_t new_ring_depth;  /* NEW(payload) ring slots; 0 => default */
+
+    /* Parallel decode tasks (1 or 2; 0 => 1, clamped to 2). 2 runs a second
+     * decoder on a second core for higher per-frame catch reliability -- worth it
+     * only where that core is otherwise free (the portrait DSI scan). */
+    uint8_t num_decoders;
 } scan_coordinator_config_t;
 
 typedef struct scan_coordinator scan_coordinator_t;

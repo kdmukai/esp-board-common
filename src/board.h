@@ -134,6 +134,29 @@ void board_display_partition_blit_gutters(void);
 void board_display_partition_blit(int32_t x_start, int32_t y_start,
                                   int32_t x_end, int32_t y_end, const void *buf);
 
+/* ── Portrait scan display mode (ST7701 MIPI-DSI 4.3 only) ────────────────────
+ * The 4.3 renders its landscape UI by CPU-rotating every LVGL frame 90° to the
+ * native-portrait panel — the per-frame rotate pegs core 0 and blocks a 2nd
+ * decoder (Phase 0 probe proved a 2nd decoder ~doubles throughput). These bracket
+ * a QR-scan session: enter reconfigures the LVGL display to native portrait with
+ * NO rotation (RENDER_MODE_PARTIAL, direct flush) so the camera can sub-region
+ * blit its centered square and LVGL renders only the letterbox — freeing core 0.
+ * In-place reconfig (not recreate) so screens + touch indev survive; touch is
+ * swapped to portrait and restored on exit. Idempotent. MUST be called with the
+ * scan's LVGL screen active. No-op stub on non-ST7701 boards (they partition or
+ * are already portrait). Every scan-teardown path must call exit before the next
+ * landscape render. */
+void board_display_enter_portrait_scan(void);
+void board_display_exit_portrait_scan(void);
+
+/* Single-writer panel blit for portrait scan mode: serializes the camera's
+ * centered-square blit against LVGL's letterbox flush through the panel's one
+ * DMA2D draw path (mutex + wait-own-completion) — both writers share the DPI
+ * draw_sem, so a concurrent draw_bitmap trips ESP_ERR_INVALID_STATE. Ends
+ * exclusive, like esp_lcd_panel_draw_bitmap. No-op stub on non-ST7701 boards. */
+void board_display_portrait_scan_blit(int32_t x1, int32_t y1,
+                                      int32_t x2, int32_t y2, const void *buf);
+
 /** Get LCD panel handle (for diagnostic/testing that bypasses LVGL). */
 esp_lcd_panel_handle_t board_get_panel_handle(void);
 
