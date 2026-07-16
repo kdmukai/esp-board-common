@@ -931,6 +931,20 @@ static void lvgl_port_setup(const board_app_config_t *app_cfg,
                                LV_DISPLAY_RENDER_MODE_FULL);
         lv_display_set_flush_cb(disp, st7701_landscape_flush_cb);
         lv_display_set_flush_wait_cb(disp, st7701_flush_wait_cb);
+        /* Paint this display's default screen black before the LVGL handler task
+         * can flush it — we still hold the port lock that task must take to run.
+         * LVGL's default screen is WHITE, and on this MIPI-DSI panel the DPI
+         * peripheral scans the current framebuffer out continuously, so that
+         * white default would show as a flash the instant the backlight turns on
+         * (a beat before the boot logo renders). The DPI framebuffers power up
+         * black (IDF calloc's them in esp_lcd_new_panel_dpi), so with a black
+         * default no white frame is ever produced and the panel stays black
+         * until the boot logo. GRAM SPI/QSPI panels never exhibited this — they
+         * display only explicit writes, with the backlight already off — which
+         * is why this lives in the ST7701 landscape branch alone and leaves the
+         * other boards' boot path untouched. */
+        lv_obj_set_style_bg_color(lv_display_get_screen_active(disp),
+                                  lv_color_black(), LV_PART_MAIN);
         lvgl_port_unlock();
 
         /* Register BOTH callbacks in one call (the driver copies both fields, so
