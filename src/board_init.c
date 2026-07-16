@@ -1244,12 +1244,39 @@ static void cp2_camera_portrait_task(void *arg)
 
 /* ── Board interface implementation ── */
 
+/* Keep the backlight lit continuously from plug-in through the boot logo (no
+ * mid-boot dip). Opt-in per board; default off preserves the hide-init-behind-a-
+ * dark-backlight behavior. See the backlight block in board_init(). */
+#ifndef BOARD_BACKLIGHT_KEEP_ON_AT_BOOT
+#define BOARD_BACKLIGHT_KEEP_ON_AT_BOOT 0
+#endif
+
 int board_init(const board_app_config_t *app_cfg,
                lv_display_t **disp, lv_indev_t **touch_indev)
 {
     ESP_LOGI(TAG, "Initializing %s...", BOARD_NAME);
 
     bool landscape = app_cfg && app_cfg->landscape;
+
+    /* Backlight PWM — configured first thing in bring-up so its state is defined
+     * before the display comes up.
+     *
+     * Default policy (BOARD_BACKLIGHT_KEEP_ON_AT_BOOT=0): leave it OFF through the
+     * whole bring-up; the caller raises it once the boot logo has rendered, so the
+     * panel's power-up/init transient stays hidden. GRAM SPI/QSPI boards use this.
+     *
+     * KEEP_ON policy (the ST7701 DSI board): the inverted backlight pin already
+     * lights at plug-in, and — thanks to the black default screen + calloc'd DPI
+     * framebuffers — the panel shows only BLACK from power-up until the boot logo.
+     * So keep the backlight ON continuously: the user gets immediate power-on
+     * feedback and never sees a mid-boot dip (it previously lit at plug-in, snapped
+     * off when the PWM was configured, then came back on with the logo). Holding it
+     * on through init is only safe because the white-flash fix guarantees no white
+     * frame is ever produced during bring-up. */
+    board_backlight_init(BOARD_PIN_LCD_BL);
+#if BOARD_BACKLIGHT_KEEP_ON_AT_BOOT
+    board_backlight_set(100);
+#endif
 
     /* Step 0: Radio co-processor hold-in-reset (air gap).
      * Boards with an external radio co-processor (e.g. the ESP32-C6 behind
@@ -1349,10 +1376,9 @@ int board_init(const board_app_config_t *app_cfg,
     }
 #endif
 
-    /* Step 6: Backlight — init PWM but keep off (duty=0).
-     * Caller turns it on after rendering the first frame to avoid
-     * a flash of LVGL's default white background. */
-    board_backlight_init(BOARD_PIN_LCD_BL);
+    /* Backlight PWM was configured to its off state at the top of board_init
+     * (before the display/PMIC/touch bring-up) so a cold power-on doesn't sit lit
+     * over the init sequence. The caller raises it after the boot logo renders. */
 
     /* Step 7: LVGL port */
     lvgl_port_setup(app_cfg, disp, touch_indev);
