@@ -44,6 +44,11 @@
 
 /* ── Backlight ── */
 #define BOARD_BACKLIGHT_INVERTED    1   /* Higher duty = dimmer on this board */
+/* Keep the backlight lit from plug-in through the boot logo (no mid-boot dip).
+ * The inverted pin lights the backlight at power-up; with the black default
+ * screen + calloc'd DPI framebuffers the panel is black until the logo, so
+ * there's nothing to hide behind a dark backlight. */
+#define BOARD_BACKLIGHT_KEEP_ON_AT_BOOT   1
 
 /* ── IO Expander ── */
 #define BOARD_HAS_IO_EXPANDER   0
