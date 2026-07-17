@@ -24,10 +24,9 @@ CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=4096
 # k_quirc (fork submodule) hardcodes MAX_VERSION=25 in k_quirc.h — its version DB
 # is only populated through v25 (covers 2-of-3 v15, UR animated baseline v17,
 # 3-of-5 v19, BBQr-low v18; BBQr-max v27 needs the DB extended). MAX_VERSION /
-# ADAPTIVE_THRESHOLD are no longer Kconfig knobs in the fork. Contrast stretch is.
+# ADAPTIVE_THRESHOLD are no longer Kconfig knobs in the fork.
 # See docs/qr-scanning-performance-requirements.md and
 # docs/knowledge/k-quirc-max-version-db-bound.md.
-CONFIG_K_QUIRC_CONTRAST_STRETCH=y
 
 # Decode-resolution sweep knob (0 = auto/480). Set per sweep build.
 CONFIG_QR_DECODE_SQUARE=0
