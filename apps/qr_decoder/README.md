@@ -62,5 +62,4 @@ Key settings in `sdkconfig.defaults`:
 
 - `CONFIG_K_QUIRC_MAX_VERSION=15` — supports QR codes up to version 15 (77x77 modules)
 - `CONFIG_K_QUIRC_ADAPTIVE_THRESHOLD=y` — better detection in varied lighting
-- `CONFIG_K_QUIRC_CONTRAST_STRETCH=y` — low-light enhancement
 - `CONFIG_CAM_PIPELINE_DEBUG=y` — enables FPS stats overlay
