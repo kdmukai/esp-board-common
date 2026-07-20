@@ -139,15 +139,32 @@ static void invalidate_area_guard_cb(lv_event_t *e)
  *     the shadow FB (byte-swapped, panel-ready) + mark the gutter dirty; the
  *     camera consumer blits them. LVGL issues ZERO SPI transactions. (stage 2) */
 #define GUTTER_BAND_LINES 40
+/* Rows per band when compositing the FULL panel width (the suspended still-frame path).
+ * Full width is ~6x a gutter column, so proportionally fewer rows keeps each DMA
+ * transaction in the same byte class the squeezed internal heap already tolerates. */
+#define FULL_BAND_LINES   8
 static volatile bool s_cam_flush_redirect = false;
 static uint16_t *s_shadow_fb  = NULL;   /* full landscape frame, panel-ready (byte-swapped) */
 static uint16_t *s_gutter_dma = NULL;   /* internal-DMA band buffer for gutter blits */
 static int32_t   s_shadow_w = 0, s_shadow_h = 0;   /* shadow FB dims (LVGL/panel space) */
 static int32_t   s_sq_x1 = 0, s_sq_x2 = -1;        /* camera-square column span; gutters flank it */
+static int32_t   s_sq_y = 0, s_sq_h = 0;           /* square row span, cached so suspend/resume can restore the reserved rect */
 static int32_t   s_gutter_w = 0;                   /* wider of the two gutters (DMA band width) */
+static size_t    s_band_bytes = 0;                 /* capacity of the band buffer; caps rows/band */
 static SemaphoreHandle_t s_shadow_mutex = NULL;    /* guards shadow FB: LVGL write vs camera read */
 static lv_display_t *s_std_disp = NULL;
 static SemaphoreHandle_t s_blit_sem = NULL;        /* signalled per draw_bitmap DMA completion */
+/* Serialises PANEL writes for the whole session. The single-writer rule used to be
+ * convention only ("call these from the camera consumer task"), which nothing enforced —
+ * a second caller silently raced the bus AND stole s_blit_sem completions from the
+ * first. This mutex makes the invariant structural, and is what lets suspend() wait out
+ * an in-flight blit instead of assuming a frozen pipeline means a quiesced consumer
+ * (it does not: freeze only stops FUTURE frames). NB s_shadow_mutex guards the shadow
+ * FRAMEBUFFER, not the panel — it is not a substitute for this. */
+static SemaphoreHandle_t s_writer_mutex = NULL;
+/* Set while the fence is lifted for a still frame: camera-side panel writes no-op so a
+ * late frame cannot reintroduce a second writer while LVGL owns the panel. */
+static volatile bool s_partition_suspended = false;
 
 /* Our own on_color_trans_done for the ST7796 panel IO (replaces esp_lvgl_port's).
  * Every draw_bitmap DMA completion: (1) signal s_blit_sem so a camera-path blit can
@@ -168,20 +185,111 @@ static bool std_spi_blit_done_cb(esp_lcd_panel_io_handle_t io,
     return woken == pdTRUE;
 }
 
-/* Synchronous panel blit for the camera path: draw_bitmap + WAIT for its DMA to
- * finish, so the caller may safely reuse the source buffer immediately. Only the
- * camera consumer (sole SPI writer) uses this during a session. */
-void board_display_partition_blit(int32_t x_start, int32_t y_start,
-                                  int32_t x_end, int32_t y_end, const void *buf)
+/* Invalidate the two gutter columns as SEPARATE areas. A single full-screen
+ * invalidation does NOT work while the fence is up: invalidate_area_guard_cb() clips an
+ * overlapping area to ONE gutter slab (an LVGL invalidation is a single rectangle and
+ * cannot express two disjoint columns), so whichever side loses the branch is silently
+ * dropped and keeps stale pixels — visibly, the right pillar not repainting on reshoot.
+ * Issuing one area per gutter keeps each wholly outside the reserved rect, so the guard
+ * takes its no-overlap early return and leaves both intact.
+ * Caller must hold the LVGL lock. */
+static void invalidate_gutters(void)
+{
+    lv_obj_t *scr = lv_screen_active();
+    if (!scr) return;
+    if (s_sq_x1 > 0) {
+        lv_area_t left = { .x1 = 0, .y1 = 0,
+                           .x2 = s_sq_x1 - 1, .y2 = s_shadow_h - 1 };
+        lv_obj_invalidate_area(scr, &left);
+    }
+    if (s_sq_x2 < s_shadow_w - 1) {
+        lv_area_t right = { .x1 = s_sq_x2 + 1, .y1 = 0,
+                            .x2 = s_shadow_w - 1, .y2 = s_shadow_h - 1 };
+        lv_obj_invalidate_area(scr, &right);
+    }
+}
+
+/* Raw panel write. Caller MUST hold s_writer_mutex. Split out from the public entry
+ * point so the shadow-FB compositor can drive the panel while suspended, without
+ * tripping the camera-path guard below (and without recursive locking). */
+static void panel_blit_unlocked(int32_t x_start, int32_t y_start,
+                                int32_t x_end, int32_t y_end, const void *buf)
 {
     if (s_blit_sem) xSemaphoreTake(s_blit_sem, 0);   /* drop any stale completion */
     esp_err_t bret = esp_lcd_panel_draw_bitmap(panel_handle, x_start, y_start, x_end, y_end, buf);
     if (bret != ESP_OK) {
         ESP_LOGE(TAG, "partition blit failed: %s %d,%d..%d,%d",
                  esp_err_to_name(bret), (int)x_start, (int)y_start, (int)x_end, (int)y_end);
+        return;   /* nothing queued -> no completion will arrive; don't wait for one */
     }
     /* Wait for THIS blit's DMA to finish before the caller reuses `buf`. */
     if (s_blit_sem) xSemaphoreTake(s_blit_sem, pdMS_TO_TICKS(100));
+}
+
+/* Push a rectangle of the shadow FB to the panel in BANDS sized to the small DMA
+ * buffer. This is the whole point of the compositor: partition mode runs with a
+ * camera-squeezed internal DMA heap, so a single full-width transaction fails to
+ * allocate (ESP_ERR_NO_MEM), the flush never completes, and LVGL waits forever.
+ * Banding keeps every transaction in the size class the gutter path always used. */
+static void blit_shadow_region(int32_t x1, int32_t y1, int32_t x2, int32_t y2)
+{
+    if (!s_shadow_fb || !s_gutter_dma || s_band_bytes == 0) return;
+    if (x1 < 0) x1 = 0;
+    if (y1 < 0) y1 = 0;
+    if (x2 > s_shadow_w - 1) x2 = s_shadow_w - 1;
+    if (y2 > s_shadow_h - 1) y2 = s_shadow_h - 1;
+    int32_t w = x2 - x1 + 1;
+    if (w <= 0 || y2 < y1) return;
+
+    /* Rows per band that fit the buffer at THIS width (wider region -> fewer rows). */
+    int32_t lines = (int32_t)(s_band_bytes / ((size_t)w * 2));
+    if (lines < 1) lines = 1;
+
+    for (int32_t y = y1; y <= y2; y += lines) {
+        int32_t bh = (y + lines - 1 > y2) ? (y2 - y + 1) : lines;
+        /* Hold the writer mutex across the WHOLE band — copy and DMA. This function runs
+         * on the LVGL task, while partition_end() frees these buffers from the pipeline
+         * teardown task; without this the free lands mid-DMA (observed: taskLVGL crash in
+         * blit_shadow_region on Accept). Re-validate under the lock each band, because
+         * teardown may have nulled them between iterations. Lock order is writer ->
+         * shadow everywhere. */
+        if (s_writer_mutex) xSemaphoreTake(s_writer_mutex, portMAX_DELAY);
+        if (!s_shadow_fb || !s_gutter_dma) {
+            if (s_writer_mutex) xSemaphoreGive(s_writer_mutex);
+            return;   /* session torn down under us — stop compositing */
+        }
+        if (s_shadow_mutex) xSemaphoreTake(s_shadow_mutex, portMAX_DELAY);
+        for (int32_t r = 0; r < bh; r++) {
+            memcpy(&s_gutter_dma[(size_t)r * w],
+                   &s_shadow_fb[(size_t)(y + r) * s_shadow_w + x1],
+                   (size_t)w * 2);
+        }
+        if (s_shadow_mutex) xSemaphoreGive(s_shadow_mutex);
+        panel_blit_unlocked(x1, y, x2 + 1, y + bh, s_gutter_dma);
+        if (s_writer_mutex) xSemaphoreGive(s_writer_mutex);
+    }
+}
+
+/* Synchronous panel blit for the camera path: draw_bitmap + WAIT for its DMA to
+ * finish, so the caller may safely reuse the source buffer immediately. Only the
+ * camera consumer (sole SPI writer) uses this during a session. */
+void board_display_partition_blit(int32_t x_start, int32_t y_start,
+                                  int32_t x_end, int32_t y_end, const void *buf)
+{
+    /* Held across draw_bitmap AND its completion wait, so s_blit_sem can never be
+     * consumed by a different writer's blit. Uncontended in steady state (the consumer
+     * is the only caller), so the cost is a sub-microsecond take/give against a blit
+     * that runs for milliseconds. Contention occurs only at suspend()/resume(), i.e.
+     * once per capture / reshoot. Taken per-blit rather than around a whole gutter pass
+     * so suspend() can cut in between bands instead of waiting for all of them. */
+    if (s_writer_mutex) xSemaphoreTake(s_writer_mutex, portMAX_DELAY);
+    if (s_partition_suspended) {
+        /* Still frame: the compositor owns the panel — drop camera-side writes. */
+        if (s_writer_mutex) xSemaphoreGive(s_writer_mutex);
+        return;
+    }
+    panel_blit_unlocked(x_start, y_start, x_end, y_end, buf);
+    if (s_writer_mutex) xSemaphoreGive(s_writer_mutex);
 }
 
 static void std_spi_partition_flush_cb(lv_display_t *disp,
@@ -209,6 +317,13 @@ static void std_spi_partition_flush_cb(lv_display_t *disp,
             }
         }
         if (s_shadow_mutex) xSemaphoreGive(s_shadow_mutex);
+        /* Suspended still-frame: the camera is frozen, so nothing else will ever push
+         * the shadow FB to the panel — do it here, banded. LVGL still issues no SPI
+         * itself, which is exactly what keeps us clear of the ESP_ERR_NO_MEM that a
+         * full-width LVGL flush hits against the camera-squeezed internal DMA heap. */
+        if (s_partition_suspended) {
+            blit_shadow_region(area->x1, area->y1, area->x2, area->y2);
+        }
         lv_display_flush_ready(disp);
         return;
     }
@@ -230,7 +345,10 @@ esp_err_t board_display_partition_begin(int32_t disp_w, int32_t disp_h,
 {
     s_shadow_w = disp_w;  s_shadow_h = disp_h;
     s_sq_x1 = sq_x;       s_sq_x2 = sq_x + sq_w - 1;
+    s_sq_y  = sq_y;       s_sq_h  = sq_h;
     if (!s_shadow_mutex) s_shadow_mutex = xSemaphoreCreateMutex();
+    if (!s_writer_mutex) s_writer_mutex = xSemaphoreCreateMutex();
+    s_partition_suspended = false;   /* a fresh session always starts fenced */
     if (!s_shadow_fb) {
         s_shadow_fb = heap_caps_calloc(1, (size_t)disp_w * disp_h * 2, MALLOC_CAP_SPIRAM);
         if (!s_shadow_fb) {
@@ -245,16 +363,22 @@ esp_err_t board_display_partition_begin(int32_t disp_w, int32_t disp_h,
     int32_t gw_l = sq_x, gw_r = disp_w - (sq_x + sq_w);
     s_gutter_w = (gw_l > gw_r) ? gw_l : gw_r;
     if (s_gutter_w < 1) s_gutter_w = 1;
+    /* One band buffer serves both users: gutter columns (narrow x GUTTER_BAND_LINES)
+     * and the suspended full-width compositor (wide x FULL_BAND_LINES). Size it to
+     * whichever needs more, so neither ever asks the SPI driver to allocate. */
+    {
+        size_t gutter_need = (size_t)s_gutter_w * GUTTER_BAND_LINES * 2;
+        size_t full_need   = (size_t)disp_w * FULL_BAND_LINES * 2;
+        s_band_bytes = (gutter_need > full_need) ? gutter_need : full_need;
+    }
     if (!s_gutter_dma) {
         /* 64-byte aligned so the gutter blit is zero-copy too: an unaligned DMA
          * source makes the SPI master bounce-allocate per blit, churning the
          * DMA-capable heap (see the stripe-cap note in the pipeline). */
-        s_gutter_dma = heap_caps_aligned_alloc(64,
-                                        (size_t)s_gutter_w * GUTTER_BAND_LINES * 2,
-                                        MALLOC_CAP_DMA);
+        s_gutter_dma = heap_caps_aligned_alloc(64, s_band_bytes, MALLOC_CAP_DMA);
         if (!s_gutter_dma) {
-            ESP_LOGE(TAG, "gutter DMA alloc failed (%d B; INTERNAL free=%u largest=%u)",
-                     (int)((size_t)s_gutter_w * GUTTER_BAND_LINES * 2),
+            ESP_LOGE(TAG, "band DMA alloc failed (%d B; INTERNAL free=%u largest=%u)",
+                     (int)s_band_bytes,
                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
             heap_caps_free(s_shadow_fb); s_shadow_fb = NULL;
@@ -267,9 +391,11 @@ esp_err_t board_display_partition_begin(int32_t disp_w, int32_t disp_h,
      * the chrome; the camera paints the square on its first frame. */
     board_display_set_reserved_rect(sq_x, sq_y, sq_w, sq_h);
     s_cam_flush_redirect = true;
-    /* Kick LVGL to render the current overlay screen into the shadow FB. */
+    /* Kick LVGL to render the current overlay screen into the shadow FB. Per-gutter
+     * areas, not a full-screen invalidate — the fence is already up, and a full-width
+     * area would be clipped to one gutter (see invalidate_gutters). */
     if (s_std_disp && lvgl_port_lock(100)) {
-        lv_obj_invalidate(lv_screen_active());
+        invalidate_gutters();
         lvgl_port_unlock();
     }
     ESP_LOGI(TAG, "Partition single-writer begin: %"PRId32"x%"PRId32
@@ -288,11 +414,104 @@ void board_display_partition_end(void)
      * mid-copy into the buffers we free. */
     s_cam_flush_redirect = false;
     board_display_clear_reserved_rect();
+    /* Free under the WRITER mutex, not just the shadow mutex. Accept reaches end()
+     * straight from a suspended CONFIRM, where the compositor is running on the LVGL
+     * task and is actively DMA-ing out of s_gutter_dma — freeing on this (teardown)
+     * task without that lock is a use-after-free. Holding it waits out the in-flight
+     * band; nulling the pointers under it makes the compositor's per-band re-validation
+     * bail instead of touching freed memory. Also clears the suspended latch so the
+     * next session doesn't start with its camera-side writes no-oping. */
+    if (s_writer_mutex) xSemaphoreTake(s_writer_mutex, portMAX_DELAY);
+    s_partition_suspended = false;
     if (s_shadow_mutex) xSemaphoreTake(s_shadow_mutex, portMAX_DELAY);
     if (s_shadow_fb)  { heap_caps_free(s_shadow_fb);  s_shadow_fb = NULL; }
     if (s_gutter_dma) { heap_caps_free(s_gutter_dma); s_gutter_dma = NULL; }
+    s_band_bytes = 0;
     if (s_shadow_mutex) xSemaphoreGive(s_shadow_mutex);
+    if (s_writer_mutex) xSemaphoreGive(s_writer_mutex);
     ESP_LOGI(TAG, "Partition single-writer end");
+}
+
+/* Hand the WHOLE panel back to LVGL mid-session, without tearing the session down.
+ *
+ * Why this exists: during a partition session LVGL is fenced out of the camera square,
+ * so anything it draws there is invisible — which is why the image-entropy CONFIRM
+ * review image and its Accept button cannot be shown on a partition board. Once the
+ * pipeline is FROZEN the picture is static and the camera is no longer writing, so the
+ * two-writer collision that motivated partition mode cannot occur and LVGL can safely
+ * own the full panel again.
+ *
+ * CALLER CONTRACT: the pipeline MUST already be frozen (cam_pipeline_freeze) before
+ * calling. That is what guarantees no square blit or gutter blit is pending — this
+ * function only serialises against a flush/gutter copy that is already in progress,
+ * it cannot stop a consumer that is still being fed frames.
+ *
+ * Unlike partition_end() the shadow FB + gutter band are KEPT, so resume() is instant
+ * (a reshoot must not pay a realloc), and the session's geometry stays cached. */
+void board_display_partition_suspend(void)
+{
+    if (!s_cam_flush_redirect || s_partition_suspended) return;
+    /* Take the WRITER mutex: this blocks until any in-flight camera blit has finished
+     * its DMA, and stops the next one from starting. Only then is it safe to clear the
+     * redirect — otherwise a camera blit completing afterwards would see !redirect in
+     * std_spi_blit_done_cb() and fire a spurious lv_display_flush_ready(), corrupting
+     * LVGL's draw-buffer accounting and over-queueing the SPI bus on the next full
+     * render (queue full -> hang). Setting s_partition_suspended under the same lock
+     * makes every later camera-side write a no-op, so a late frame cannot race us.
+     *
+     * Deadlock rule: NEVER hold this mutex while taking lvgl_port_lock — release it
+     * first, then repaint below. */
+    if (s_writer_mutex) xSemaphoreTake(s_writer_mutex, portMAX_DELAY);
+    /* NOTE: s_cam_flush_redirect deliberately STAYS true. Clearing it hands the panel
+     * to LVGL, whose full-width flush cannot allocate a DMA transaction against the
+     * camera-squeezed internal heap (ESP_ERR_NO_MEM -> flush never completes -> LVGL
+     * waits forever). Keeping the redirect means LVGL renders into the shadow FB and
+     * issues zero SPI; the flush callback then composites that region to the panel in
+     * bands we already have memory for. */
+    s_partition_suspended = true;
+    if (s_writer_mutex) xSemaphoreGive(s_writer_mutex);
+    /* Drop the fence so LVGL renders the SQUARE too, not just the gutters. */
+    board_display_clear_reserved_rect();
+    /* Repaint so LVGL covers the square, which still holds the camera's last frame.
+     * Safe here (unlike partition_end): the pipeline is frozen, so there is no second
+     * writer to race — that hazard is why end() deliberately does NOT repaint. */
+    /* Full-screen invalidate is correct HERE (unlike begin/resume): the fence is down,
+     * so nothing clips it and LVGL renders the square as well as the gutters. */
+    if (s_std_disp && lvgl_port_lock(100)) {
+        lv_obj_invalidate(lv_screen_active());
+        lvgl_port_unlock();
+    }
+    ESP_LOGI(TAG, "Partition suspended: compositing the full surface (frozen preview)");
+}
+
+/* Re-fence the camera square and resume redirecting LVGL to the shadow FB — the
+ * reshoot path, undoing suspend(). Reuses the buffers and geometry cached by begin(),
+ * so it must only follow a suspend() within the same session. The caller unfreezes the
+ * pipeline AFTER this returns, so the camera resumes as sole writer of the square. */
+void board_display_partition_resume(void)
+{
+    if (!s_partition_suspended) return;                              /* not suspended */
+    if (!s_shadow_fb || !s_gutter_dma || s_sq_x2 < s_sq_x1) return;  /* no live session */
+    /* Re-fence BEFORE re-enabling camera writes: the reserved rect must be back so LVGL
+     * stops painting the square, and the redirect back on so its flush leaves the bus.
+     * Flip both under the writer mutex, mirroring suspend(). The caller unfreezes the
+     * pipeline only after this returns, so the camera's first write follows the flip. */
+    /* Re-fence the square so LVGL stops rendering it, then hand it back to the camera.
+     * s_cam_flush_redirect was never cleared by suspend(), so there is nothing to
+     * restore there — only the fence and the suspended flag move. */
+    board_display_set_reserved_rect(s_sq_x1, s_sq_y, s_sq_x2 - s_sq_x1 + 1, s_sq_h);
+    if (s_writer_mutex) xSemaphoreTake(s_writer_mutex, portMAX_DELAY);
+    s_partition_suspended = false;
+    if (s_writer_mutex) xSemaphoreGive(s_writer_mutex);
+    /* Re-render the chrome into the shadow FB; the camera repaints the square on its
+     * first unfrozen frame. MUST be per-gutter: the fence is back up, so a full-screen
+     * invalidate is clipped to the LEFT gutter only and the right pillar keeps the
+     * stale CONFIRM pixels (the reshoot artifact this fixes). */
+    if (s_std_disp && lvgl_port_lock(100)) {
+        invalidate_gutters();
+        lvgl_port_unlock();
+    }
+    ESP_LOGI(TAG, "Partition resumed: camera owns the square again");
 }
 
 /* Blit both gutter columns from the shadow FB to the panel. MUST be called only
@@ -301,25 +520,13 @@ void board_display_partition_end(void)
 void board_display_partition_blit_gutters(void)
 {
     if (!s_cam_flush_redirect || !s_shadow_fb || !s_gutter_dma) return;
-    int32_t spans[2][2] = { { 0, s_sq_x1 - 1 }, { s_sq_x2 + 1, s_shadow_w - 1 } };
-    for (int g = 0; g < 2; g++) {
-        int32_t gx1 = spans[g][0], gx2 = spans[g][1];
-        int32_t gw = gx2 - gx1 + 1;
-        if (gw <= 0) continue;
-        for (int32_t y = 0; y < s_shadow_h; y += GUTTER_BAND_LINES) {
-            int32_t bh = (y + GUTTER_BAND_LINES > s_shadow_h) ? s_shadow_h - y : GUTTER_BAND_LINES;
-            if (s_shadow_mutex) xSemaphoreTake(s_shadow_mutex, portMAX_DELAY);
-            for (int32_t r = 0; r < bh; r++) {
-                memcpy(&s_gutter_dma[(size_t)r * gw],
-                       &s_shadow_fb[(size_t)(y + r) * s_shadow_w + gx1],
-                       (size_t)gw * 2);
-            }
-            if (s_shadow_mutex) xSemaphoreGive(s_shadow_mutex);
-            /* Synchronous: wait for the DMA before the next band reuses
-             * s_gutter_dma (draw_bitmap is async, trans_queue_depth=10). */
-            board_display_partition_blit(gx1, y, gx2 + 1, y + bh, s_gutter_dma);
-        }
-    }
+    /* Suspended: the flush callback composites the whole surface itself, and the camera
+     * is frozen — nothing to push per-frame here. */
+    if (s_partition_suspended) return;
+    /* Two gutter columns, banded, via the shared compositor (which picks rows/band to
+     * fit the buffer at this width and holds the writer mutex per band). */
+    blit_shadow_region(0, 0, s_sq_x1 - 1, s_shadow_h - 1);
+    blit_shadow_region(s_sq_x2 + 1, 0, s_shadow_w - 1, s_shadow_h - 1);
 }
 #endif /* BOARD_CAMERA_PARTITION_MODE */
 #endif /* BOARD_DISPLAY_STD_SPI */
@@ -354,6 +561,8 @@ esp_err_t board_display_partition_begin(int32_t disp_w, int32_t disp_h,
     return ESP_OK;
 }
 void board_display_partition_end(void) {}
+void board_display_partition_suspend(void) {}
+void board_display_partition_resume(void) {}
 void board_display_partition_blit_gutters(void) {}
 void board_display_partition_blit(int32_t x_start, int32_t y_start,
                                   int32_t x_end, int32_t y_end, const void *buf)

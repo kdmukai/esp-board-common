@@ -127,6 +127,17 @@ esp_err_t board_display_partition_begin(int32_t disp_w, int32_t disp_h,
                                         int32_t sq_x, int32_t sq_y,
                                         int32_t sq_w, int32_t sq_h);
 void board_display_partition_end(void);
+/* Mid-session suspend/resume of the fence, for showing a STILL full-screen frame (the
+ * image-entropy CONFIRM review image + its Accept button) on a partition board, where
+ * LVGL is otherwise fenced out of the camera square and anything drawn there is
+ * invisible. suspend() hands the whole panel back to LVGL and repaints; resume()
+ * re-fences the square for a reshoot. Buffers and geometry are kept across the pair, so
+ * resume is instant. The pipeline MUST already be frozen before suspend() — that is what
+ * guarantees the camera is not still writing (there is then only one writer, so this is
+ * safe to call from the host thread, unlike the blit entry points above). Unlike
+ * begin()/end() these do NOT allocate or free. No-op stubs on non-partition boards. */
+void board_display_partition_suspend(void);
+void board_display_partition_resume(void);
 void board_display_partition_blit_gutters(void);
 /* Synchronous panel blit (draw_bitmap + wait for DMA completion) — lets the camera
  * consumer reuse its source buffer immediately. Ends are exclusive, like
