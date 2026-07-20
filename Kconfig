@@ -15,13 +15,28 @@ menu "Board Common"
 
     config BOARD_CSI_AE_TARGET
         int "CSI camera auto-exposure target (0 = ISP default)"
-        default 0
+        default 110
         range 0 235
         help
             Auto-exposure setpoint for the CSI (OV5647) ISP pipeline, 2-235.
-            Higher = brighter; 128 = neutral. 0 leaves the ISP/sensor default,
-            which over-exposes when scanning bright backlit screens (QR module
-            highlights clip). Set ~60-80 to dial exposure back for on-screen QR
-            scanning without dimming the source. Applied at camera start.
+            Higher = brighter; 128 = neutral. 0 leaves the ISP/sensor default.
+
+            Decode is a BAND in captured-crop brightness, not a "brighter is
+            better" ramp: it wants crop mean ~168-180 and falls off at BOTH
+            ends. Too dim and the AEC reaches for analog gain, whose read-noise
+            swamps the black/white module separation; too bright and clipped
+            highlights eat into that separation from the other side.
+
+            110 lands mid-band on the two panel types that matter most for
+            on-screen scanning -- measured decode-rate 1.00 on a mounted 32" VA
+            viewed on-axis (crop mean 180), and 1.00 on a MacBook at -3 (crop
+            mean 168-177). Prior guidance here suggested ~60-80; sweeps show
+            that range yields crop mean ~110-155 and decode-rate 0.00, so do
+            not go there.
+
+            NB: the AEC meters the whole frame while the decoder only sees the
+            centre crop, so the target needed for a given crop mean shifts with
+            how bright the surround is -- re-measure if the framing changes
+            substantially. Applied at camera start.
 
 endmenu
