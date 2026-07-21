@@ -89,6 +89,12 @@
  * counter-clockwise, so 270° CCW == the required 90° CW correction. Pinned on
  * device 2026-07-10; flip 270<->90 if the preview lands mirrored/upside down. */
 #define BOARD_CAMERA_ROTATION       270
+
+/* High-resolution image-entropy still: a SQUARE at 2x the display square
+ * (min(480,320)=320 → 640). Grabbed by a second PPA pass, hashed full-resolution,
+ * shown downsampled with pillar bars. P4 only (needs PPA). */
+#define BOARD_ENTROPY_STILL_DIM     640
+
 #define BOARD_PIN_CAM_SCCB_SDA      GPIO_NUM_7
 #define BOARD_PIN_CAM_SCCB_SCL      GPIO_NUM_8
 #define BOARD_CAM_SCCB_I2C_PORT     0   /* Shares main I2C bus */

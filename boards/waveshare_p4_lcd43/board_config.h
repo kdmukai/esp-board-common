@@ -97,6 +97,12 @@
 #define BOARD_PIN_CAM_SCCB_SCL      GPIO_NUM_8
 #define BOARD_CAM_SCCB_I2C_PORT     0   /* Shares main I2C bus */
 
+/* High-resolution image-entropy still: a SQUARE at 2x the display square
+ * (min(800,480)=480 → 960 — the sensor's native 1:1 square FOV). Grabbed by a
+ * second PPA pass, hashed full-resolution, shown downsampled with pillar bars.
+ * P4 only (needs PPA). */
+#define BOARD_ENTROPY_STILL_DIM     960
+
 /* ── SD Card (4-bit SDMMC) ── */
 #ifndef BOARD_HAS_SDCARD
 #define BOARD_HAS_SDCARD            1
