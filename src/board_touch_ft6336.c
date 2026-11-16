@@ -13,6 +13,10 @@
 
 static const char *TAG = "touch_ft6336";
 
+/* FT5x06 touch threshold registers (THGROUP..THDIFF, 0x80-0x85) */
+#define FT5x06_ID_G_THGROUP             (0x80)
+#define FT5x06_TH_REG_COUNT             6
+
 /* FT5x06 scan rate / power mode registers */
 #define FT5x06_ID_G_CTRL                (0x86)
 #define FT5x06_ID_G_PERIODACTIVE        (0x88)
@@ -70,6 +74,12 @@ esp_lcd_touch_handle_t board_touch_ft6336_init(i2c_master_bus_handle_t bus,
     touch_io_config.scl_speed_hz = 400000;
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c(bus, &touch_io_config, &touch_io_handle));
 
+    /* Save the controller's pre-init touch thresholds before the Espressif
+     * driver overwrites them with its FT5x06 values; restored after init below. */
+    uint8_t saved_th[FT5x06_TH_REG_COUNT];
+    esp_err_t th_err = esp_lcd_panel_io_rx_param(touch_io_handle, FT5x06_ID_G_THGROUP,
+                                                 saved_th, sizeof(saved_th));
+
     esp_lcd_touch_config_t tp_cfg = {
         .x_max = x_max,
         .y_max = y_max,
@@ -87,6 +97,29 @@ esp_lcd_touch_handle_t board_touch_ft6336_init(i2c_master_bus_handle_t bus,
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "FT6336 touch init failed (0x%x) — continuing without touch", err);
         return NULL;
+    }
+
+    /* Restore the saved touch thresholds.
+     *
+     * The driver's init writes FT5x06 thresholds (THGROUP=70, THDIFF=20, ...)
+     * over the FT6336's own panel tuning (THGROUP=25, THDIFF=160 on the P4
+     * 3.5"). With the driver values the P4 3.5" controller drops a moving
+     * finger after ~30ms, so a swipe reaches LVGL as a short press at its
+     * start point and selects the button under it instead of scrolling. */
+    if (th_err != ESP_OK) {
+        ESP_LOGW(TAG, "Threshold read failed (0x%x); keeping driver values", th_err);
+    } else {
+        for (int i = 0; i < FT5x06_TH_REG_COUNT && th_err == ESP_OK; i++) {
+            th_err = esp_lcd_panel_io_tx_param(touch_handle->io, FT5x06_ID_G_THGROUP + i,
+                                               &saved_th[i], 1);
+        }
+        if (th_err == ESP_OK) {
+            ESP_LOGI(TAG, "Thresholds restored: THGROUP=%u THDIFF=%u",
+                     saved_th[0], saved_th[FT5x06_TH_REG_COUNT - 1]);
+        } else {
+            ESP_LOGW(TAG, "Threshold restore failed (0x%x); some driver values remain",
+                     th_err);
+        }
     }
 
     /* Override Espressif driver defaults for better swipe detection.
